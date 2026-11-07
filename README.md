@@ -29,6 +29,8 @@ wellspring plugin link "$PWD"
 wellspring start
 ```
 
+需要宿主 >= 1.7.6：`sandbox.network: true` 在 Node permission model 层放行 `--allow-net` 从这个版本开始。
+
 配置文件：`<configDir>/plugins/wellspring-gateway.json`（不存在时全部用默认值）。
 
 ## 配置
