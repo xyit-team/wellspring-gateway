@@ -116,9 +116,9 @@ export function setup() {
 - 消费者在 `deps` 里声明 `wellspring-gateway`，保证网关先初始化、事件不会丢
 - 消费者崩溃没来得及注销时路由保留到下次重启，`/__gateway/status` 会显示 `upstream: down`
 
-## 首页与诊断
+## 页面与诊断
 
-- `GET /`：登录后显示已注册服务列表（路径、来源），可直接点进各入口；配置了 `/` 路由时走代理
+- `GET /`：未登录跳 `/login`；登录后显示账户页（修改密码、运行状态、注销），不再列出已注册服务；配置了 `/` 路由时走代理
 - `GET /__gateway/health`：无需登录，返回 `{ status, auth }`
 - `GET /__gateway/status`：登录后返回版本、运行时长、认证状态、`sso`（`enabled`、`cookieName`、`loginPath`、`verifyPath`、`sessionsFile`）、全部路由与上游连通性（TCP 探测，3 秒缓存）
 
@@ -127,7 +127,10 @@ export function setup() {
 - 首次访问任意受保护页面跳转 `/login`，设置管理密码（6–200 位）
 - 密码哈希（scrypt）保存在插件数据目录的 `auth.json`；会话 token 只在内存，重启后需重新登录
 - 登录失败按来源 IP 限流，超限返回 429
-- `/login` 后的 `next` 参数只接受站内路径，或同主机（任意端口）同协议的绝对地址；其它主机一律回退 `/`
+- 登录回跳参数：`redirect`（推荐）与 `next`（兼容）都支持；值可以是站内路径、`host[:port][/path]` 形式的本机地址，或同主机（任意端口）的绝对地址
+- `redirect` / `next` 只接受同主机地址与本机地址（loopback、10/8、172.16/12、192.168/16、169.254/16、IPv6 ::1、ULA、链路本地）；公网地址与陌生主机一律回退 `/`
+- 回跳协议必须与当前请求一致：https 网关下 bare 地址（默认 http）与 http 目标回退 `/`
+- 其他端口的服务登录回跳格式：`http://127.0.0.1:8780/login?redirect=127.0.0.1%3A8787%2Fpath`，登录后 302 到 `http://127.0.0.1:8787/path`
 - 修改密码：`/__gateway/password`（需登录），修改后所有旧会话失效
 - 注销：`GET` / `POST /logout`
 - 健康检查：`GET /__gateway/health`（无需登录）
@@ -141,8 +144,8 @@ export function setup() {
 ### 原理
 
 - 会话 cookie `wellspring_session` 是 host-only：`Set-Cookie` 不带 `Domain`，浏览器对同一主机（如 `127.0.0.1`）的任意端口都会带上它。属性为 `Path=/; HttpOnly; SameSite=Lax; Max-Age=<会话秒数>`，TLS 时另加 `Secure`
-- 其他端口的服务自行校验这个 cookie：有效就直接服务；未登录就 302 到 `http://127.0.0.1:<网关端口>/login?next=<自己的原始地址>`。网关登录后 302 回原地址，cookie 已经在同一主机上，其他端口自动认证
-- 已登录时访问 `/login?next=` 直接回跳，不再显示登录页
+- 其他端口的服务自行校验这个 cookie：有效就直接服务；未登录就 302 到 `http://127.0.0.1:<网关端口>/login?redirect=<自己的地址>`（地址形如 `127.0.0.1:8787/path`，也可为 `192.168.31.138:8787` 这类本机网卡地址）。网关登录后 302 回该地址，cookie 已经在同一主机上，其他端口自动认证
+- 已登录时访问 `/login?redirect=` 直接回跳，不再显示登录页
 - 主机名必须一致：`127.0.0.1` 与 `localhost` 是两个不同主机，cookie 不互通
 - 协议必须一致：TLS 时 cookie 带 `Secure`，只发给 https 端口；其他端口要与网关同为 http 或同为 https
 - 网关无法拦截直连其他端口的请求：其他端口的服务必须自己接入校验，未登录时自己发起跳转
@@ -153,10 +156,10 @@ export function setup() {
   ▼
 其他端口服务（127.0.0.1:8787）
   │ 校验 wellspring_session：无效
-  │ ② 302 Location: http://127.0.0.1:8780/login?next=<URL 编码的 http://127.0.0.1:8787/page>
+  │ ② 302 Location: http://127.0.0.1:8780/login?redirect=<URL 编码的 127.0.0.1:8787/page>
   ▼
 浏览器
-  │ ③ GET http://127.0.0.1:8780/login?next=...
+  │ ③ GET http://127.0.0.1:8780/login?redirect=...
   ▼
 网关（127.0.0.1:8780）
   │ ④ 登录成功：Set-Cookie: wellspring_session=...; Path=/; HttpOnly; SameSite=Lax（不带 Domain）
@@ -169,7 +172,7 @@ export function setup() {
   │ 校验通过 → 200
 ```
 
-② 的 `next` 是 URL 编码后的原始地址；网关回跳前校验它只指向同主机任意端口、同协议的地址，其它目标回退 `/`。
+② 的 `redirect` 是 URL 编码后的原始地址；网关回跳前校验它只指向同主机任意端口或本机地址，其它目标回退 `/`。登录地址的主机名沿用浏览器当前使用的主机名（换 `192.168.31.138` 访问 8787 时跳 `192.168.31.138:8780` 登录，网关需要监听该地址）。
 
 ### 两种校验方式
 
@@ -307,12 +310,12 @@ export function setup() {
                 authEnabled: discovery.authEnabled,
                 sessions: async () => await data?.readJson(discovery.sessionsFile),
             })
-            const scheme = new URL(discovery.url).protocol
             await api.http.createServer({ host: "127.0.0.1", port: 8787 }, async (request) => {
                 const result = await sso.verify(request.headers)
                 if (!result.ok) {
                     const host = request.headers["host"] ?? "127.0.0.1:8787"
-                    const current = `${scheme}//${host}${request.url}`
+                    /* 回跳地址用 host[:port]/path，网关登录后补全协议并跳回 */
+                    const current = `${host}${request.url}`
                     // handler 返回 { status, headers, body }，助手结果可以直接返回
                     return acceptsHtml(request.headers)
                         ? sso.redirectToLogin(current)
@@ -335,6 +338,8 @@ export function setup() {
 - HTTP 模式不传 `sessions`，`verify` 改为请求网关校验接口；默认超时 3000 毫秒，网关不可达按未登录处理
 - `acceptsHtml(headers)` 在 `Accept` 含 `text/html` 或 `*/*` 时返回 `true`，用来区分页面请求（跳登录）与显式 API 请求（401 JSON）
 - `readSsoDiscovery` 在文件缺失、格式不合法或无读取权限时返回 `null`
+- `loginUrl(returnUrl?)` 生成 `<网关>/login?redirect=<编码后的回跳地址>`；回跳地址用 `host[:port][/path]` 或绝对地址
+- 浏览器用局域网地址访问其他端口时，登录地址的主机名应换成请求 Host 的主机名（`wellspring-web` 的 `src/session.ts` 是完整实现）
 - 客户端还提供 `sessionToken(headers)`、`loginUrl(returnUrl?)`、`reset()`；模块另外导出 `sessionTokenOf`、`sha256Hex`、`lookupSessionInSnapshot`、`acceptsHtml`，便于自定义接入
 - `createSsoClient` 选项：`gatewayUrl`（必填）、`authEnabled`、`cookieName`、`loginPath`、`verifyPath`、`sessions`、`cacheTtlMs`、`timeoutMs`、`fetch`；返回对象含 `verify`、`sessionToken`、`loginUrl`、`redirectToLogin`、`unauthorized`、`reset` 与 `gatewayUrl`、`cookieName`、`authEnabled`
 
@@ -376,6 +381,8 @@ export function setup() {
 - 上游来自静态配置或插件注册；消费者崩溃未注销时路由保留到重启（status 显示 down）
 - WebSocket 只做字节流转发，不解析帧
 - 跨端口 SSO 只复用网关会话：其他端口的服务必须自己接入校验并自己发起登录跳转，网关无法拦截直连这些端口的请求
+- 登录回跳允许本机与局域网地址：构造 `redirect` 链接可把已登录用户带向局域网内其它主机页面（host-only cookie 不随跳转外泄，风险为钓鱼/误导），`redirect` 只应来自受信服务
+- TLS 网关下直连 http 端口无法复用会话：`Secure` cookie 不发给 http，跨协议回跳会被拒绝
 - 跨端口会话要求主机名与协议一致：`127.0.0.1` 与 `localhost` 不互通；TLS 的 `Secure` cookie 不会发给 http 端口
 - 反向代理必须保留浏览器原始 `Host`：网关用 `Host` 判断回跳目标是否同源，并校验登录 `POST` 的 `Origin`；改写 `Host` 会让登录返回 403
 - 本地快照是近实时镜像：快照在启动、登录、注销、改密与定时清理时重写，写入失败会重试并尽快补写；磁盘持续故障时其他端口的会话状态可能滞后。要求登出/改密立即全端口生效时用 HTTP 校验模式
@@ -396,8 +403,8 @@ npm run build:zip     # release/wellspring-gateway-<version>.zip
 
 ```bash
 # 改 package.json 的 version，提交后推同名 tag
-git tag -a v0.2.1 -m "v0.2.1"
-git push origin master refs/tags/v0.2.1
+git tag -a v0.5.0 -m "v0.5.0"
+git push origin master refs/tags/v0.5.0
 ```
 
 推 `v*` 标签触发 `release.yml`（zip + SHA256SUMS 挂 GitHub Release）与 `publish-npm.yml`

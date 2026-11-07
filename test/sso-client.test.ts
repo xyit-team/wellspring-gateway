@@ -142,9 +142,9 @@ test("loginUrl：默认、returnUrl 编码与结尾斜杠归一化", () => {
     const target = "/app/page?a=1&b=2"
     assert.equal(
         client.loginUrl(target),
-        `${GATEWAY_URL}${SSO_LOGIN_PATH}?next=${encodeURIComponent(target)}`,
+        `${GATEWAY_URL}${SSO_LOGIN_PATH}?redirect=${encodeURIComponent(target)}`,
     )
-    const returnUrl = client.loginUrl(target).split("?next=")[1]
+    const returnUrl = client.loginUrl(target).split("?redirect=")[1]
     assert.equal(returnUrl, "%2Fapp%2Fpage%3Fa%3D1%26b%3D2")
 
     const trailing = createSsoClient({ gatewayUrl: `${GATEWAY_URL}/` })

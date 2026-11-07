@@ -22,9 +22,10 @@ import {
     normalizeHostName,
     originAllowed,
     preflightHeaders,
+    isLocalAddress,
     redirectContextOf,
     requestProtocol,
-    resolveNext,
+    resolveRedirect,
     sessionSnapshotJson,
 } from "../src/sso.ts"
 
@@ -194,34 +195,98 @@ test("redirectContextOf：协议与当前 Host", () => {
     assert.equal(secure.hostname, null)
 })
 
-test("resolveNext：只允许站内路径与同主机任意端口的绝对地址", () => {
+test("resolveRedirect：站内路径、本机地址与同主机绝对地址", () => {
     const context = redirectContextOf("127.0.0.1:8780", false)
-    assert.equal(resolveNext(undefined, context), "/")
-    assert.equal(resolveNext("", context), "/")
-    assert.equal(resolveNext("/web?x=1", context), "/web?x=1")
-    assert.equal(resolveNext("//evil.example/", context), "/")
-    assert.equal(resolveNext("/\\evil.example", context), "/")
-    assert.equal(resolveNext("http://evil.example/", context), "/")
-    assert.equal(resolveNext("ftp://127.0.0.1:8787/", context), "/")
-    assert.equal(resolveNext("https://127.0.0.1:8787/", context), "/")
-    assert.equal(resolveNext("http://user:pass@127.0.0.1:8787/", context), "/")
-    assert.equal(resolveNext("not a url", context), "/")
-    assert.equal(resolveNext("/web\r\nSet-Cookie: x=y", context), "/")
-    assert.equal(resolveNext("http://127.0.0.1:8787/\u0000", context), "/")
+    assert.equal(resolveRedirect(undefined, context), "/")
+    assert.equal(resolveRedirect("", context), "/")
+    assert.equal(resolveRedirect("/web?x=1", context), "/web?x=1")
+    assert.equal(resolveRedirect("//evil.example/", context), "/")
+    assert.equal(resolveRedirect("/\\evil.example", context), "/")
+    assert.equal(resolveRedirect("not a url", context), "/")
+    assert.equal(resolveRedirect("/web\r\nSet-Cookie: x=y", context), "/")
+
+    assert.equal(resolveRedirect("127.0.0.1:8787", context), "http://127.0.0.1:8787/")
     assert.equal(
-        resolveNext("http://127.0.0.1:8787/page?x=1", context),
+        resolveRedirect("127.0.0.1:8787/deep/link?x=1", context),
+        "http://127.0.0.1:8787/deep/link?x=1",
+    )
+    assert.equal(
+        resolveRedirect("192.168.31.138:8787", context),
+        "http://192.168.31.138:8787/",
+    )
+    assert.equal(
+        resolveRedirect("http://192.168.31.138:8787/page", context),
+        "http://192.168.31.138:8787/page",
+    )
+    assert.equal(
+        resolveRedirect("http://127.0.0.1:8787/page?x=1", context),
         "http://127.0.0.1:8787/page?x=1",
     )
-    assert.equal(resolveNext("http://localhost:8787/", context), "/")
-    assert.equal(resolveNext("http://127.0.0.1.evil.com:8787/", context), "/")
-    assert.equal(resolveNext("http://127.0.0.1:8787@evil.example/", context), "/")
+    assert.equal(resolveRedirect("https://127.0.0.1:8787/", context), "/")
+
+    /* 协议一致：https 网关下 bare 地址回退 */
+    const httpsContext = redirectContextOf("127.0.0.1:8780", true)
+    assert.equal(resolveRedirect("127.0.0.1:8787", httpsContext), "/")
+    assert.equal(resolveRedirect("http://127.0.0.1:8787/", httpsContext), "/")
+    assert.equal(
+        resolveRedirect("https://127.0.0.1:8787/", httpsContext),
+        "https://127.0.0.1:8787/",
+    )
+
+    /* 外站、公网 IP、userinfo、陌生主机名 */
+    assert.equal(resolveRedirect("http://evil.example/", context), "/")
+    assert.equal(resolveRedirect("//evil.example/", context), "/")
+    assert.equal(resolveRedirect("8.8.8.8:8787", context), "/")
+    assert.equal(resolveRedirect("http://user:pass@127.0.0.1:8787/", context), "/")
+    assert.equal(resolveRedirect("http://127.0.0.1:8787@evil.example/", context), "/")
+    assert.equal(resolveRedirect("http://127.0.0.1.evil.com:8787/", context), "/")
+    assert.equal(resolveRedirect("localhost:8787", context), "/")
+    assert.equal(resolveRedirect("ftp://127.0.0.1:8787/", context), "/")
+
+    const localhostContext = redirectContextOf("localhost:8780", false)
+    assert.equal(
+        resolveRedirect("localhost:8787/page", localhostContext),
+        "http://localhost:8787/page",
+    )
+    assert.equal(
+        resolveRedirect("localhost.:8787/page", localhostContext),
+        "http://localhost.:8787/page",
+    )
 })
 
-test("formatHostForUrl：IPv6 补方括号，其它主机原样", () => {
-    assert.equal(formatHostForUrl("127.0.0.1"), "127.0.0.1")
-    assert.equal(formatHostForUrl("localhost"), "localhost")
-    assert.equal(formatHostForUrl("::1"), "[::1]")
-    assert.equal(formatHostForUrl("[::1]"), "[::1]")
+test("isLocalAddress：loopback、私有网段、链路本地与 IPv6", () => {
+    for (const host of [
+        "127.0.0.1",
+        "127.8.8.8",
+        "10.0.0.1",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.31.138",
+        "169.254.1.1",
+        "[::1]",
+        "[fc00::1]",
+        "[fd00::1]",
+        "[fdff::1]",
+        "[fe80::1]",
+        "[febf::1]",
+    ]) {
+        assert.equal(isLocalAddress(host), true, host)
+    }
+    for (const host of [
+        "8.8.8.8",
+        "172.32.0.1",
+        "192.169.1.1",
+        "localhost",
+        "evil.example",
+        "[2001:db8::1]",
+        "127.0.0.1.evil.example",
+        "[fc::1]",
+        "[fe8::1]",
+        "[fea::1]",
+        "[fec0::1]",
+    ]) {
+        assert.equal(isLocalAddress(host), false, host)
+    }
 })
 
 test("CORS：同主机任意端口为来源，跨协议与陌生来源拒绝", () => {
@@ -613,7 +678,7 @@ async function startConsumer(
             }
             const returnUrl = `http://${req.headers.host ?? "127.0.0.1"}${url}`
             res.writeHead(302, {
-                location: `${gatewayUrl}${SSO_LOGIN_PATH}?next=${encodeURIComponent(returnUrl)}`,
+                location: `${gatewayUrl}${SSO_LOGIN_PATH}?redirect=${encodeURIComponent(returnUrl)}`,
                 "cache-control": "no-store",
             })
             res.end()
@@ -650,22 +715,22 @@ test("双端口 SSO：登录网关后其他端口页面自动认证", async () =
     const fixture = await startGateway([], {}, storage)
     const consumer = await startConsumer(fixture.gateway.url, storage)
     try {
-        /* 1. 未登录直接访问其他端口：跳网关登录页，next 是原始地址 */
+        /* 1. 未登录直接访问其他端口：跳网关登录页，redirect 是原始地址 */
         const anonymous = await fetch(`${consumer.url}/deep/link?x=1`, {
             redirect: "manual",
             headers: { accept: "text/html" },
         })
         assert.equal(anonymous.status, 302)
         const loginLocation = anonymous.headers.get("location") ?? ""
-        assert.ok(loginLocation.startsWith(`${fixture.gateway.url}${SSO_LOGIN_PATH}?next=`))
-        const next = new URL(loginLocation).searchParams.get("next")
+        assert.ok(loginLocation.startsWith(`${fixture.gateway.url}${SSO_LOGIN_PATH}?redirect=`))
+        const next = new URL(loginLocation).searchParams.get("redirect")
         assert.equal(next, `${consumer.url}/deep/link?x=1`)
 
         /* 2. 在网关登录（首次设置密码），拿会话 cookie */
         const loginResponse = await postForm(`${fixture.gateway.url}${SSO_LOGIN_PATH}`, {
             password: "secret123",
             confirm: "secret123",
-            next: next ?? "/",
+            redirect: next ?? "/",
         })
         assert.equal(loginResponse.status, 302)
         assert.equal(loginResponse.headers.get("location"), next)

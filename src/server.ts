@@ -1,7 +1,7 @@
 /*
  * 网关服务
  *
- * 单端口对外：自有端点（登录、密码、健康检查、状态、首页）先处理，其余按路由反代到上游
+ * 单端口对外：自有端点（登录、密码、健康检查、状态、账户页）先处理，其余按路由反代到上游
  * 鉴权开启时，未登录请求重定向到 /login（HTML）或返回 401（其它）；public 路由免登录
  */
 
@@ -19,7 +19,7 @@ import type { Duplex } from "node:stream"
 import { AuthStore, GATEWAY_USER, SESSION_COOKIE, passwordProblem } from "./auth.ts"
 import { parseTarget, upstreamPath, type GatewayConfig } from "./config.ts"
 import { GATEWAY_VERSION } from "./version.ts"
-import { homePage, loginPage, messagePage, passwordPage } from "./pages.ts"
+import { accountPage, loginPage, messagePage, passwordPage } from "./pages.ts"
 import type { GatewayUpstreamInfo } from "./protocol.ts"
 import {
     forwardRequest,
@@ -38,7 +38,7 @@ import {
     formatHostForUrl,
     preflightHeaders,
     redirectContextOf,
-    resolveNext,
+    resolveRedirect,
     sessionSnapshotJson,
     type RedirectContext,
 } from "./sso.ts"
@@ -312,9 +312,13 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         htmlResponse(res, status, messagePage({ title, message: text }))
     }
 
-    function loginNext(url: URL, form: URLSearchParams | null, req: IncomingMessage): string {
-        const raw = form?.get("next") ?? url.searchParams.get("next")
-        return resolveNext(raw, redirectContext(req))
+    function loginTarget(url: URL, form: URLSearchParams | null, req: IncomingMessage): string {
+        const raw =
+            form?.get("redirect") ??
+            form?.get("next") ??
+            url.searchParams.get("redirect") ??
+            url.searchParams.get("next")
+        return resolveRedirect(raw, redirectContext(req))
     }
 
     async function setLoginCookie(
@@ -406,7 +410,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             return
         }
         const form = await readForm(req)
-        const next = loginNext(url, form, req)
+        const next = loginTarget(url, form, req)
         const ip = remoteAddressOf(req)
 
         if (!auth.hasPassword) {
@@ -555,7 +559,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             }
             if (path === "/login") {
                 if (!config.auth.enabled) {
-                    redirect(res, "/")
+                    redirect(res, loginTarget(url, null, req))
                     return
                 }
                 if (method === "POST") {
@@ -566,13 +570,23 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                     message(res, 405, "不支持的请求", "GET / POST")
                     return
                 }
-                const next = loginNext(url, null, req)
+                const target = loginTarget(url, null, req)
                 /* 已登录时直接回跳：其他端口的服务跳来登录后不会再停在登录页 */
                 if (authorized) {
-                    redirect(res, next)
+                    redirect(res, target)
                     return
                 }
-                htmlResponse(res, 200, loginPage({ hasPassword: auth.hasPassword, next }))
+                const hasRedirect = url.searchParams.get("redirect") !== null
+                const hasNext = url.searchParams.get("next") !== null
+                htmlResponse(
+                    res,
+                    200,
+                    loginPage({
+                        hasPassword: auth.hasPassword,
+                        ...(hasRedirect ? { redirect: target } : {}),
+                        ...(hasNext && !hasRedirect ? { next: target } : {}),
+                    }),
+                )
                 return
             }
             if (path === "/logout") {
@@ -606,19 +620,15 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             const match = routeTable.match(path)
             if (match === null) {
                 if (!authorized) {
+                    if (path === "/" || path === "") {
+                        redirect(res, "/login")
+                        return
+                    }
                     unauthorized(req, res, url)
                     return
                 }
                 if (path === "/" || path === "") {
-                    htmlResponse(
-                        res,
-                        200,
-                        homePage({ routes: routeTable.list().map((entry) => ({
-                            prefix: entry.config.prefix,
-                            name: entry.name,
-                            source: entry.source,
-                        })) }),
-                    )
+                    htmlResponse(res, 200, accountPage())
                     return
                 }
                 message(res, 404, "页面不存在", `${method} ${path}`)

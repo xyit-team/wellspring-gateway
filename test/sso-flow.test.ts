@@ -166,7 +166,7 @@ async function loginThroughGateway(
     const response = await postForm(`${gatewayUrl}/login`, {
         password,
         confirm: password,
-        next: returnUrl,
+        redirect: returnUrl,
     })
     assert.equal(response.status, 302)
     assert.equal(response.headers.get("location"), returnUrl)
@@ -206,8 +206,8 @@ test("本地快照模式：跨端口服务无需出网即可自动认证", async
             })
             assert.equal(anonymous.status, 302)
             const loginLocation = anonymous.headers.get("location") ?? ""
-            assert.ok(loginLocation.startsWith(`${discovery.url}/login?next=`))
-            const next = new URL(loginLocation).searchParams.get("next")
+            assert.ok(loginLocation.startsWith(`${discovery.url}/login?redirect=`))
+            const next = new URL(loginLocation).searchParams.get("redirect")
             assert.equal(next, `${consumer.url}/deep/link?x=1`)
 
             const cookie = await loginThroughGateway(discovery.url, next ?? "/")
@@ -254,7 +254,7 @@ test("HTTP 校验模式：跨端口服务调网关校验接口", async () => {
                 headers: { accept: "text/html" },
             })
             assert.equal(anonymous.status, 302)
-            const next = new URL(anonymous.headers.get("location") ?? "").searchParams.get("next")
+            const next = new URL(anonymous.headers.get("location") ?? "").searchParams.get("redirect")
             const cookie = await loginThroughGateway(discovery.url, next ?? "/")
 
             const authed = await fetch(`${consumer.url}/page`, { headers: { cookie } })

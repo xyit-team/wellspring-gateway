@@ -61,7 +61,7 @@ export function normalizeHostName(value: string): string | null {
         trimmed.includes(":") && !trimmed.startsWith("[") ? [trimmed, `[${trimmed}]`] : [trimmed]
     for (const candidate of candidates) {
         try {
-            const hostname = new URL(`http://${candidate}`).hostname.toLowerCase()
+            const hostname = new URL(`http://${candidate}`).hostname.toLowerCase().replace(/\.+$/, "")
             if (hostname !== "") {
                 return hostname
             }
@@ -153,8 +153,49 @@ export function preflightHeaders(
     return headers
 }
 
-/** 登录后的回跳目标：站内相对路径，或同主机（任意端口）同协议的绝对地址 */
-export function resolveNext(raw: string | null | undefined, context: RedirectContext): string {
+/** 本机地址：loopback、私有网段、链路本地与 IPv6 ULA */
+export function isLocalAddress(hostname: string): boolean {
+    const host = hostname.toLowerCase()
+    if (host === "[::1]") {
+        return true
+    }
+    const inner = /^\[([0-9a-f:]+)\]$/.exec(host)?.[1]
+    if (inner !== undefined) {
+        const first = inner.split(":").find((part) => part !== "") ?? "0"
+        const value = Number.parseInt(first.padStart(4, "0").slice(0, 4), 16)
+        if (Number.isNaN(value)) {
+            return false
+        }
+        /* fc00::/7 与 fe80::/10 */
+        return (value & 0xfe00) === 0xfc00 || (value & 0xffc0) === 0xfe80
+    }
+    const parts = host.split(".")
+    if (parts.length !== 4) {
+        return false
+    }
+    const numbers = parts.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : Number.NaN))
+    if (numbers.some((value) => Number.isNaN(value) || value > 255)) {
+        return false
+    }
+    const first = numbers[0] ?? 0
+    const second = numbers[1] ?? 0
+    if (first === 10 || first === 127) {
+        return true
+    }
+    if (first === 169 && second === 254) {
+        return true
+    }
+    if (first === 172 && second >= 16 && second <= 31) {
+        return true
+    }
+    return first === 192 && second === 168
+}
+
+/*
+ * 登录后的回跳目标：站内相对路径；或本机地址、同主机（任意端口）的绝对地址
+ * 支持 bare 形式 host[:port][/path]，默认 http
+ */
+export function resolveRedirect(raw: string | null | undefined, context: RedirectContext): string {
     if (typeof raw !== "string" || raw === "" || raw.includes("\\")) {
         return "/"
     }
@@ -168,9 +209,14 @@ export function resolveNext(raw: string | null | undefined, context: RedirectCon
         }
         return raw
     }
+    const explicitScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)
+    /* bare 地址是 http 直连端口；https 网关下无法确定目标协议 */
+    if (!explicitScheme && context.protocol !== "http:") {
+        return "/"
+    }
     let target: URL
     try {
-        target = new URL(raw)
+        target = explicitScheme ? new URL(raw) : new URL(`http://${raw}`)
     } catch {
         return "/"
     }
@@ -180,10 +226,11 @@ export function resolveNext(raw: string | null | undefined, context: RedirectCon
     if (target.username !== "" || target.password !== "") {
         return "/"
     }
-    if (context.hostname === null || target.hostname.toLowerCase() !== context.hostname) {
-        return "/"
+    const hostname = target.hostname.toLowerCase().replace(/\.+$/, "")
+    if (context.hostname !== null && hostname === context.hostname) {
+        return target.href
     }
-    return target.href
+    return isLocalAddress(hostname) ? target.href : "/"
 }
 
 export function sessionSnapshotJson(

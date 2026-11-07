@@ -126,14 +126,23 @@ function errorBlock(error: string | undefined): string {
 export interface LoginPageOptions {
     readonly hasPassword: boolean
     readonly error?: string
+    /** 登录后回跳目标（redirect 参数） */
+    readonly redirect?: string
     readonly next?: string
 }
 
+function hiddenTargetField(options: LoginPageOptions): string {
+    if (options.redirect !== undefined) {
+        return `<input type="hidden" name="redirect" value="${escapeHtml(options.redirect)}">`
+    }
+    if (options.next !== undefined) {
+        return `<input type="hidden" name="next" value="${escapeHtml(options.next)}">`
+    }
+    return ""
+}
+
 export function loginPage(options: LoginPageOptions): string {
-    const nextField =
-        options.next === undefined
-            ? ""
-            : `<input type="hidden" name="next" value="${escapeHtml(options.next)}">`
+    const nextField = hiddenTargetField(options)
     if (!options.hasPassword) {
         return layout(
             "设置管理密码",
@@ -199,31 +208,15 @@ export function messagePage(options: MessagePageOptions): string {
     )
 }
 
-export interface HomeRouteLink {
-    readonly prefix: string
-    readonly name: string | null
-    readonly source: "config" | "plugin"
-}
-
-export interface HomePageOptions {
-    readonly routes: readonly HomeRouteLink[]
-}
-
-export function homePage(options: HomePageOptions): string {
-    const items =
-        options.routes.length === 0
-            ? `<p class="hint">暂无已注册服务</p>`
-            : `<ul class="routes">${options.routes
-                  .map((route) => {
-                      const label = route.name ?? route.prefix
-                      const source = route.source === "config" ? "配置" : "插件"
-                      return `<li><a href="${escapeHtml(route.prefix === "/" ? "/" : route.prefix.replace(/\/+$/, "") + "/")}"><span>${escapeHtml(label)}</span><span class="source">${escapeHtml(route.prefix)} · ${source}</span></a></li>`
-                  })
-                  .join("")}</ul>`
+export function accountPage(): string {
     return layout(
         "Wellspring",
         `<h1>Wellspring</h1>
-<p class="hint">选择一个服务</p>
-${items}`,
+<p class="hint">已登录</p>
+<ul class="routes">
+<li><a href="/__gateway/password"><span>修改密码</span></a></li>
+<li><a href="/__gateway/status"><span>运行状态</span></a></li>
+<li><a href="/logout"><span>注销</span></a></li>
+</ul>`,
     )
 }

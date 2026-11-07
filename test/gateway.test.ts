@@ -511,13 +511,68 @@ test("TLS 监听", async () => {
     }
 })
 
-test("首页列出已注册路由", async () => {
+test("根路径：未登录跳登录页，登录后显示账户页且不再列服务", async () => {
+    const anonymous = await fetch(`${gateway.gateway.url}/`, {
+        redirect: "manual",
+        headers: { accept: "text/html" },
+    })
+    assert.equal(anonymous.status, 302)
+    assert.equal(anonymous.headers.get("location"), "/login")
+
     const cookie = await login(gateway.gateway)
     const response = await fetch(`${gateway.gateway.url}/`, { headers: { cookie } })
     assert.equal(response.status, 200)
     const html = await response.text()
-    assert.match(html, /\/web/)
-    assert.match(html, /\/raw/)
+    assert.match(html, /\/__gateway\/password/)
+    assert.match(html, /\/logout/)
+    assert.doesNotMatch(html, /选择一个服务/)
+    assert.doesNotMatch(html, /\/web/)
+    assert.doesNotMatch(html, /\/raw/)
+})
+
+test("登录 redirect 参数：本机地址回跳，公网地址拒绝", async () => {
+    const isolated = await startGateway([route("/web", upstream.url)])
+    try {
+        const loopback = await postForm(`${isolated.gateway.url}/login`, {
+            password: "secret123",
+            confirm: "secret123",
+            redirect: "127.0.0.1:8787/deep/link?x=1",
+        })
+        assert.equal(loopback.status, 302)
+        assert.equal(loopback.headers.get("location"), "http://127.0.0.1:8787/deep/link?x=1")
+
+        const lan = await postForm(`${isolated.gateway.url}/login`, {
+            password: "secret123",
+            redirect: "192.168.31.138:8787",
+        })
+        assert.equal(lan.status, 302)
+        assert.equal(lan.headers.get("location"), "http://192.168.31.138:8787/")
+
+        const publicAddress = await postForm(`${isolated.gateway.url}/login`, {
+            password: "secret123",
+            redirect: "8.8.8.8:8787",
+        })
+        assert.equal(publicAddress.status, 302)
+        assert.equal(publicAddress.headers.get("location"), "/")
+
+        const evil = await postForm(`${isolated.gateway.url}/login`, {
+            password: "secret123",
+            redirect: "evil.example:8787",
+        })
+        assert.equal(evil.status, 302)
+        assert.equal(evil.headers.get("location"), "/")
+
+        /* 已登录时访问 /login?redirect= 直接回跳 */
+        const cookie = await login(isolated.gateway)
+        const direct = await fetch(
+            `${isolated.gateway.url}/login?redirect=${encodeURIComponent("127.0.0.1:8787/page")}`,
+            { redirect: "manual", headers: { cookie, accept: "text/html" } },
+        )
+        assert.equal(direct.status, 302)
+        assert.equal(direct.headers.get("location"), "http://127.0.0.1:8787/page")
+    } finally {
+        await isolated.close()
+    }
 })
 
 test("状态接口：未登录跳转登录页，登录后返回路由与上游状态", async () => {
@@ -536,7 +591,7 @@ test("状态接口：未登录跳转登录页，登录后返回路由与上游�
         version: string
         routes: Array<Record<string, unknown>>
     }
-    assert.equal(payload.version, "0.4.0")
+    assert.equal(payload.version, "0.5.0")
     assert.ok(
         payload.routes.some(
             (route) => route["prefix"] === "/web" && route["upstream"] === "up",

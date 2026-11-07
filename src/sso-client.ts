@@ -373,7 +373,7 @@ export function createSsoClient(options: SsoClientOptions): SsoClient {
         if (returnUrl === undefined || returnUrl === "") {
             return login
         }
-        return `${login}?next=${encodeURIComponent(returnUrl)}`
+        return `${login}?redirect=${encodeURIComponent(returnUrl)}`
     }
 
     function redirectToLogin(returnUrl: string): SsoHttpResponse {
