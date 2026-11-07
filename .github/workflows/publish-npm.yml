@@ -2,7 +2,6 @@ name: publish-npm
 
 # 发布到 npm：@xyit-team/wellspring-gateway@x.y.z
 # 认证走 npm Trusted Publishing（OIDC），仓库里不存 token
-# 当前只有占位实现：无依赖、无构建步骤，直接打包发布
 on:
     push:
         tags: ["v*"]
@@ -10,7 +9,7 @@ on:
     workflow_dispatch:
         inputs:
             tag:
-                description: 要发布的 tag（例如 v0.1.1）
+                description: 要发布的 tag（例如 v0.2.1）
                 required: true
                 type: string
             dry-run:
@@ -25,7 +24,7 @@ concurrency:
 jobs:
     publish:
         runs-on: ubuntu-24.04
-        timeout-minutes: 10
+        timeout-minutes: 20
         permissions:
             contents: read
             id-token: write
@@ -56,6 +55,15 @@ jobs:
                   fi
                   echo "node $(node -v)，npm $(npm --version)"
 
+            - name: 安装依赖（严格按 lockfile）
+              run: npm ci --no-audit --no-fund
+
+            - name: 类型检查
+              run: npm run typecheck
+
+            - name: 测试
+              run: npm test
+
             - name: 核对标签与 package.json 的版本
               env:
                   TAG: ${{ inputs.tag || github.ref_name }}
@@ -66,6 +74,7 @@ jobs:
                     echo "标签是 $TAG，但 package.json 里是 $version。"
                     exit 1
                   fi
+                  echo "版本对得上：$TAG"
 
             - name: 该版本是否已经发布
               id: exists

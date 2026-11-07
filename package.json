@@ -1,7 +1,7 @@
 {
     "name": "@xyit-team/wellspring-gateway",
-    "version": "0.1.1",
-    "description": "Wellspring 网关插件：统一入口、路由、TLS 与登录（占位版本，实现待重写）",
+    "version": "0.2.0",
+    "description": "Wellspring 网关插件：统一入口、路由、TLS 与统一登录",
     "license": "MIT",
     "repository": {
         "type": "git",
@@ -18,9 +18,21 @@
     },
     "files": [
         "index.ts",
+        "src",
         "README.md",
         "LICENSE"
     ],
+    "scripts": {
+        "typecheck": "tsc --noEmit",
+        "test": "node scripts/run-tests.mjs",
+        "build:zip": "node scripts/build-zip.mjs"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.5",
+        "@xyit/wellspring": "^1.7.5",
+        "pino": "^10.4.0",
+        "typescript": "^7.0.2"
+    },
     "wellspring": {
         "apiVersion": 1,
         "name": "wellspring-gateway",
@@ -28,12 +40,16 @@
         "github": "xyit-team/wellspring-gateway",
         "sandbox": {
             "profile": "plugin",
+            "network": true,
             "fs": {
-                "read": [],
+                "read": [
+                    "${pluginDir}"
+                ],
                 "write": []
             },
             "hostApi": [
-                "logger"
+                "logger",
+                "fs"
             ]
         }
     }

@@ -1,0 +1,81 @@
+name: release
+
+# 推 v* 标签发版：插件 zip + SHA256SUMS 挂到同名 GitHub Release
+on:
+    push:
+        tags: ["v*"]
+    # 失败重跑：Actions 页面 Run workflow，填已有 tag
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: 要发版的 tag（例如 v0.2.1）
+                required: true
+                type: string
+
+concurrency:
+    group: release-${{ github.ref_name || inputs.tag }}
+    cancel-in-progress: false
+
+jobs:
+    release:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 20
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  ref: ${{ inputs.tag || github.ref }}
+                  fetch-depth: 0
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+
+            - name: 安装依赖（严格按 lockfile）
+              run: npm ci --no-audit --no-fund
+
+            - name: 核对标签与 package.json 的版本
+              env:
+                  TAG: ${{ inputs.tag || github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  version="v$(node -p "require('./package.json').version")"
+                  if [ "$TAG" != "$version" ]; then
+                    echo "标签是 $TAG，但 package.json 里是 $version。"
+                    exit 1
+                  fi
+
+            - name: 类型检查
+              run: npm run typecheck
+
+            - name: 测试
+              run: npm test
+
+            - name: 打包插件
+              run: npm run build:zip
+
+            - name: 生成校验和
+              run: |
+                  set -euo pipefail
+                  cd release
+                  sha256sum ./*.zip > SHA256SUMS
+                  cat SHA256SUMS
+
+            - name: 建 Release 并挂 zip
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  TAG: ${{ inputs.tag || github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  files=(release/*.zip release/SHA256SUMS)
+                  ls -lh "${files[@]}"
+                  if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                    gh release upload "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --clobber
+                  else
+                    gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+                      --title "$TAG" \
+                      --generate-notes \
+                      "${files[@]}"
+                  fi
+                  gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url

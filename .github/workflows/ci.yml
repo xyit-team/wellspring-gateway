@@ -1,0 +1,45 @@
+name: ci
+
+on:
+    push:
+        branches: [master]
+    pull_request:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    test:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+
+            - name: 安装依赖（严格按 lockfile）
+              run: npm ci --no-audit --no-fund
+
+            - name: 类型检查
+              run: npm run typecheck
+
+            - name: 测试
+              run: npm test
+
+            - name: 打包插件 zip
+              run: npm run build:zip
+
+            - name: 冒烟：zip 里必须有清单、入口与源码
+              run: |
+                  set -euo pipefail
+                  unzip -Z1 release/*.zip > /tmp/zip.txt
+                  cat /tmp/zip.txt
+                  grep -qx 'package.json' /tmp/zip.txt
+                  grep -qx 'index.ts' /tmp/zip.txt
+                  grep -qx 'src/server.ts' /tmp/zip.txt
