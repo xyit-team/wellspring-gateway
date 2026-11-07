@@ -2,15 +2,27 @@
  * 网关鉴权
  *
  * 单用户密码：scrypt 哈希存 <插件数据目录>/auth.json
- * 会话 token 只保存在内存，重启后需要重新登录
+ * 会话 token 只保存在内存，重启后需要重新登录；其他端口的服务通过会话快照校验 token
  */
 
-import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto"
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto"
 
 export const AUTH_FILE = "auth.json"
 export const SESSION_COOKIE = "wellspring_session"
 export const PASSWORD_MIN_LENGTH = 6
 export const PASSWORD_MAX_LENGTH = 200
+/** 网关单用户身份；转发头与校验接口都用它 */
+export const GATEWAY_USER = "admin"
+
+/** 会话 token 的 sha256；会话快照只存哈希，不落原文 */
+export function sessionTokenHash(token: string): string {
+    return createHash("sha256").update(token, "utf8").digest("hex")
+}
+
+export interface SessionListEntry {
+    readonly hash: string
+    readonly expiresAt: number
+}
 
 const SCRYPT_KEYLEN = 64
 const SCRYPT_OPTIONS = { N: 16_384, r: 8, p: 1 } as const
@@ -193,18 +205,41 @@ export class AuthStore {
     }
 
     validateSession(token: string | undefined): boolean {
+        return this.sessionExpiresAt(token) !== null
+    }
+
+    /** 会话过期时间；token 缺失、无效或过期返回 null */
+    sessionExpiresAt(token: string | undefined): number | null {
         if (token === undefined || token === "") {
-            return false
+            return null
         }
         const expiresAt = this.#sessions.get(token)
         if (expiresAt === undefined) {
-            return false
+            return null
         }
         if (expiresAt <= this.#now()) {
             this.#sessions.delete(token)
-            return false
+            return null
         }
-        return true
+        return expiresAt
+    }
+
+    /** 当前有效会话的哈希与过期时间（跨端口校验用的快照） */
+    listSessions(): readonly SessionListEntry[] {
+        const now = this.#now()
+        const sessions: SessionListEntry[] = []
+        for (const [token, expiresAt] of this.#sessions) {
+            if (expiresAt <= now) {
+                this.#sessions.delete(token)
+                continue
+            }
+            sessions.push({ hash: sessionTokenHash(token), expiresAt })
+        }
+        sessions.sort(
+            (left, right) =>
+                left.expiresAt - right.expiresAt || left.hash.localeCompare(right.hash),
+        )
+        return sessions
     }
 
     destroySession(token: string | undefined): void {

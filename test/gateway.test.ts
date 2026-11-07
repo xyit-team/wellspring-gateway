@@ -179,6 +179,7 @@ async function startGateway(
         auth,
         logger: silentLogger,
         readText: (path) => storage.readText(path),
+        writeText: (path, text) => storage.writeText(path, text),
     })
     await gateway.start()
     return { gateway, auth, storage, close: () => gateway.close() }
@@ -535,7 +536,7 @@ test("状态接口：未登录跳转登录页，登录后返回路由与上游�
         version: string
         routes: Array<Record<string, unknown>>
     }
-    assert.equal(payload.version, "0.3.0")
+    assert.equal(payload.version, "0.4.0")
     assert.ok(
         payload.routes.some(
             (route) => route["prefix"] === "/web" && route["upstream"] === "up",

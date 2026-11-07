@@ -6,6 +6,7 @@ import {
     AuthStore,
     createAuthFile,
     passwordProblem,
+    sessionTokenHash,
     verifyAuthFile,
 } from "../src/auth.ts"
 
@@ -109,4 +110,25 @@ test("失败限流：窗口内计数、成功后清空", async () => {
     auth.recordFailure("ip")
     now += 61_000
     assert.equal(auth.isBlocked("ip"), false)
+})
+
+test("会话哈希与快照列表：只暴露哈希，过期会话被清理", async () => {
+    let now = 1_000_000
+    const { store: auth } = store(memoryStorage(), { now: () => now })
+    await auth.load()
+    assert.equal(
+        sessionTokenHash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )
+    const session = auth.createSession()
+    assert.equal(auth.sessionExpiresAt(session.token), session.expiresAt)
+    const list = auth.listSessions()
+    assert.equal(list.length, 1)
+    assert.equal(list[0]?.hash, sessionTokenHash(session.token))
+    assert.equal(list[0]?.expiresAt, session.expiresAt)
+    assert.equal(JSON.stringify(list).includes(session.token), false)
+
+    now += 2 * 60 * 60 * 1000
+    assert.equal(auth.sessionExpiresAt(session.token), null)
+    assert.deepEqual(auth.listSessions(), [])
 })

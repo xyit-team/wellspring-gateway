@@ -16,7 +16,7 @@ import { createServer as createHttpsServer } from "node:https"
 import { connect as netConnect, type AddressInfo } from "node:net"
 import type { Duplex } from "node:stream"
 
-import { AuthStore, SESSION_COOKIE, passwordProblem } from "./auth.ts"
+import { AuthStore, GATEWAY_USER, SESSION_COOKIE, passwordProblem } from "./auth.ts"
 import { parseTarget, upstreamPath, type GatewayConfig } from "./config.ts"
 import { GATEWAY_VERSION } from "./version.ts"
 import { homePage, loginPage, messagePage, passwordPage } from "./pages.ts"
@@ -28,16 +28,32 @@ import {
     type ProxyLogger,
 } from "./proxy.ts"
 import { RouteTable, type AddUpstreamResult, type RouteEntry } from "./routes.ts"
+import {
+    SSO_DISCOVERY_FILE,
+    SSO_LOGIN_PATH,
+    SSO_SESSIONS_FILE,
+    SSO_VERIFY_PATH,
+    corsHeaders,
+    discoveryJson,
+    formatHostForUrl,
+    preflightHeaders,
+    redirectContextOf,
+    resolveNext,
+    sessionSnapshotJson,
+    type RedirectContext,
+} from "./sso.ts"
 
 const BODY_LIMIT_BYTES = 16 * 1024
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000
 const PROBE_TIMEOUT_MS = 500
 const PROBE_CACHE_MS = 3000
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
+const SESSION_MIRROR_RETRY_MS = 2_000
 
 const OWN_PATHS = new Set([
     "/login",
     "/logout",
+    SSO_VERIFY_PATH,
     "/__gateway/password",
     "/__gateway/health",
     "/__gateway/status",
@@ -62,6 +78,8 @@ export interface GatewayEnv {
     readonly logger: GatewayLogger
     /** 读取插件数据目录内的文件（TLS 证书） */
     readonly readText: (path: string) => Promise<string | null>
+    /** 写插件数据目录内的文件（sessions.json / sso.json） */
+    readonly writeText: (path: string, text: string) => Promise<void>
 }
 
 export interface GatewayHandle {
@@ -103,6 +121,11 @@ function acceptsHtml(req: IncomingMessage): boolean {
     return accept.includes("text/html") || accept.includes("*/*")
 }
 
+function acceptsJson(req: IncomingMessage): boolean {
+    const accept = req.headers.accept ?? ""
+    return accept.includes("application/json")
+}
+
 function requestIdOf(req: IncomingMessage): string {
     const header = req.headers["x-request-id"]
     const provided = typeof header === "string" ? header : Array.isArray(header) ? header[0] : undefined
@@ -110,17 +133,6 @@ function requestIdOf(req: IncomingMessage): string {
         return provided
     }
     return randomUUID().replaceAll("-", "").slice(0, 16)
-}
-
-/** 只接受站内绝对路径，防开放重定向 */
-export function safeNext(value: string | null | undefined): string {
-    if (typeof value !== "string" || value === "") {
-        return "/"
-    }
-    if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) {
-        return "/"
-    }
-    return value
 }
 
 function htmlResponse(
@@ -141,13 +153,19 @@ function htmlResponse(
     res.end(body)
 }
 
-function jsonResponse(res: ServerResponse, status: number, value: unknown): void {
+function jsonResponse(
+    res: ServerResponse,
+    status: number,
+    value: unknown,
+    extraHeaders: Record<string, string> = {},
+): void {
     const body = Buffer.from(JSON.stringify(value), "utf8")
     res.writeHead(status, {
         "content-type": "application/json; charset=utf-8",
         "content-length": String(body.length),
         "cache-control": "no-store",
         ...SECURITY_HEADERS,
+        ...extraHeaders,
     })
     res.end(body)
 }
@@ -210,10 +228,17 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
     let pruneTimer: ReturnType<typeof setInterval> | null = null
 
     function gatewayUrl(): string {
-        const host = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host
+        const host =
+            config.host === "0.0.0.0" || config.host === "::"
+                ? "127.0.0.1"
+                : formatHostForUrl(config.host)
         return `${secure ? "https" : "http"}://${host}:${actualPort}`
     }
 
+    /*
+     * 会话 cookie 不带 Domain：host-only cookie 对同一主机的任意端口生效，
+     * 其他 loopback 端口的服务因此能直接读到它
+     */
     const sessionCookie = (token: string, maxAgeSeconds: number): string =>
         `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${
             secure ? "; Secure" : ""
@@ -222,15 +247,80 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
     const clearSessionCookie = (): string =>
         `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`
 
+    function redirectContext(req: IncomingMessage): RedirectContext {
+        return redirectContextOf(req.headers.host, secure)
+    }
+
+    /*
+     * 会话快照：其他端口的服务经 api.pluginData 读取后本地校验 cookie；只写 token 哈希
+     * 写入串行化：并发登录/注销时最后一次落盘为最新会话
+     * 写失败重试并补写；磁盘持续故障时快照滞后
+     */
+    let sessionMirrorChain: Promise<void> = Promise.resolve()
+    let sessionMirrorRetryTimer: ReturnType<typeof setTimeout> | null = null
+
+    /* 重试延迟不 unref：裸 Node 环境下事件循环提前退出 */
+    function delay(milliseconds: number): Promise<void> {
+        return new Promise((resolve) => {
+            setTimeout(resolve, milliseconds)
+        })
+    }
+
+    function reportSessionMirrorFailure(level: "warn" | "error", error: unknown): void {
+        const fields = { error: errorText(error) }
+        const text = "会话快照写入失败"
+        if (level === "error") {
+            logger.error(fields, text)
+        } else {
+            logger.warn(fields, text)
+        }
+        /* 补写 timer 单例：磁盘持续故障时不会随每次失败累积重试链 */
+        if (sessionMirrorRetryTimer !== null) {
+            return
+        }
+        sessionMirrorRetryTimer = setTimeout(() => {
+            sessionMirrorRetryTimer = null
+            void syncSessionMirror(level)
+        }, SESSION_MIRROR_RETRY_MS)
+        sessionMirrorRetryTimer.unref()
+    }
+
+    function syncSessionMirror(level: "warn" | "error" = "warn"): Promise<void> {
+        const task = async (): Promise<void> => {
+            let lastError: unknown = null
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                try {
+                    await env.writeText(
+                        SSO_SESSIONS_FILE,
+                        sessionSnapshotJson(auth.listSessions()),
+                    )
+                    return
+                } catch (error) {
+                    lastError = error
+                    if (attempt < 2) {
+                        await delay(150 * (attempt + 1))
+                    }
+                }
+            }
+            reportSessionMirrorFailure(level, lastError)
+        }
+        sessionMirrorChain = sessionMirrorChain.then(task)
+        return sessionMirrorChain
+    }
+
     function message(res: ServerResponse, status: number, title: string, text: string): void {
         htmlResponse(res, status, messagePage({ title, message: text }))
     }
 
-    function loginNext(url: URL, form: URLSearchParams | null): string {
-        return safeNext(form?.get("next") ?? url.searchParams.get("next"))
+    function loginNext(url: URL, form: URLSearchParams | null, req: IncomingMessage): string {
+        const raw = form?.get("next") ?? url.searchParams.get("next")
+        return resolveNext(raw, redirectContext(req))
     }
 
-    function setLoginCookie(res: ServerResponse): void {
+    async function setLoginCookie(
+        res: ServerResponse,
+        level: "warn" | "error" = "warn",
+    ): Promise<void> {
         const session = auth.createSession()
         res.setHeader(
             "set-cookie",
@@ -239,6 +329,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000)),
             ),
         )
+        await syncSessionMirror(level)
     }
 
     function isAuthorized(req: IncomingMessage): boolean {
@@ -258,13 +349,64 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         jsonResponse(res, 401, { error: "unauthorized" })
     }
 
+    /*
+     * 跨端口会话校验：其他端口的服务带上会话 cookie 来问是否有效
+     * 浏览器 fetch 从其他 loopback 端口访问时按来源回 CORS 头（同主机任意端口）
+     */
+    async function handleSessionVerify(req: IncomingMessage, res: ServerResponse): Promise<void> {
+        const method = req.method ?? "GET"
+        const context = redirectContext(req)
+        const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined
+        if (method === "OPTIONS") {
+            const requested = req.headers["access-control-request-headers"]
+            const headers = preflightHeaders(
+                origin,
+                context,
+                typeof requested === "string" ? requested : undefined,
+            )
+            res.writeHead(204, { "cache-control": "no-store", ...headers })
+            res.end()
+            return
+        }
+        const cors = corsHeaders(origin, context)
+        if (method !== "GET" && method !== "HEAD") {
+            jsonResponse(
+                res,
+                405,
+                { ok: false, error: "method-not-allowed" },
+                { ...cors, allow: "GET, HEAD, OPTIONS" },
+            )
+            return
+        }
+        if (!config.auth.enabled) {
+            jsonResponse(
+                res,
+                200,
+                { ok: true, auth: false, user: null, expiresAt: null, cookieName: SESSION_COOKIE },
+                cors,
+            )
+            return
+        }
+        const expiresAt = auth.sessionExpiresAt(cookieToken(req))
+        if (expiresAt === null) {
+            jsonResponse(res, 401, { ok: false, error: "unauthorized" }, cors)
+            return
+        }
+        jsonResponse(
+            res,
+            200,
+            { ok: true, auth: true, user: GATEWAY_USER, expiresAt, cookieName: SESSION_COOKIE },
+            cors,
+        )
+    }
+
     async function handleLogin(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
         if (!sameOrigin(req, secure)) {
             message(res, 403, "请求被拒绝", "Origin 校验失败")
             return
         }
         const form = await readForm(req)
-        const next = loginNext(url, form)
+        const next = loginNext(url, form, req)
         const ip = remoteAddressOf(req)
 
         if (!auth.hasPassword) {
@@ -280,7 +422,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 return
             }
             await auth.setPassword(password)
-            setLoginCookie(res)
+            await setLoginCookie(res)
             logger.info({ ip }, "管理密码已设置")
             redirect(res, next)
             return
@@ -299,7 +441,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             return
         }
         auth.clearFailures(ip)
-        setLoginCookie(res)
+        await setLoginCookie(res)
         redirect(res, next)
     }
 
@@ -326,7 +468,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             return
         }
         await auth.setPassword(password)
-        setLoginCookie(res)
+        await setLoginCookie(res, "error")
         logger.info({}, "管理密码已修改")
         redirect(res, "/")
     }
@@ -372,6 +514,13 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             secure,
             uptimeMs: Date.now() - startedAt,
             auth: { enabled: config.auth.enabled, hasPassword: auth.hasPassword },
+            sso: {
+                enabled: config.auth.enabled,
+                cookieName: SESSION_COOKIE,
+                loginPath: SSO_LOGIN_PATH,
+                verifyPath: SSO_VERIFY_PATH,
+                sessionsFile: SSO_SESSIONS_FILE,
+            },
             routes,
         }
     }
@@ -390,6 +539,10 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
 
             if (path === "/__gateway/health") {
                 jsonResponse(res, 200, { status: "ok", auth: config.auth.enabled })
+                return
+            }
+            if (path === SSO_VERIFY_PATH) {
+                await handleSessionVerify(req, res)
                 return
             }
             if (path === "/__gateway/status") {
@@ -413,7 +566,12 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                     message(res, 405, "不支持的请求", "GET / POST")
                     return
                 }
-                const next = safeNext(url.searchParams.get("next"))
+                const next = loginNext(url, null, req)
+                /* 已登录时直接回跳：其他端口的服务跳来登录后不会再停在登录页 */
+                if (authorized) {
+                    redirect(res, next)
+                    return
+                }
                 htmlResponse(res, 200, loginPage({ hasPassword: auth.hasPassword, next }))
                 return
             }
@@ -423,7 +581,13 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                     return
                 }
                 auth.destroySession(cookieToken(req))
-                redirect(res, "/login", { "set-cookie": clearSessionCookie() })
+                await syncSessionMirror("error")
+                const headers = { "set-cookie": clearSessionCookie() }
+                if (acceptsJson(req)) {
+                    jsonResponse(res, 200, { ok: true }, headers)
+                    return
+                }
+                redirect(res, "/login", headers)
                 return
             }
             if (path === "/__gateway/password") {
@@ -466,7 +630,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 unauthorized(req, res, url)
                 return
             }
-            actor = config.auth.enabled && authorized ? "admin" : null
+            actor = config.auth.enabled && authorized ? GATEWAY_USER : null
             const target = parseTarget(entry.config.target)
             if (target === null) {
                 message(res, 502, "上游配置错误", entry.config.target)
@@ -499,7 +663,8 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 res.destroy()
             }
         } finally {
-            if (config.accessLog) {
+            /* 校验接口会被其他端口高频调用，不进访问日志 */
+            if (config.accessLog && url.pathname !== SSO_VERIFY_PATH) {
                 logger.info(
                     {
                         requestId,
@@ -544,7 +709,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 prefix: match.entry.config.prefix,
                 remoteAddress: remoteAddressOf(req),
                 secure,
-                user: config.auth.enabled && authorized ? "admin" : null,
+                user: config.auth.enabled && authorized ? GATEWAY_USER : null,
                 timeoutMs: match.entry.config.timeoutMs ?? config.upstreamTimeoutMs,
                 requestId: requestIdOf(req),
                 logger,
@@ -600,6 +765,8 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 socket.end("HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n")
             })
             current.on("upgrade", handleUpgrade)
+            /* 启动时先清空会话快照（内存会话只属于当前进程），再监听 */
+            await syncSessionMirror()
             await new Promise<void>((resolve, reject) => {
                 const onError = (error: Error): void => {
                     current.off("listening", onListening)
@@ -618,7 +785,22 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 typeof address === "object" && address !== null
                     ? (address as AddressInfo).port
                     : config.port
-            pruneTimer = setInterval(() => auth.prune(), PRUNE_INTERVAL_MS)
+            try {
+                await env.writeText(
+                    SSO_DISCOVERY_FILE,
+                    discoveryJson({
+                        url: gatewayUrl(),
+                        authEnabled: config.auth.enabled,
+                        cookieName: SESSION_COOKIE,
+                    }),
+                )
+            } catch (error) {
+                logger.warn({ error: errorText(error) }, "sso.json 写入失败")
+            }
+            pruneTimer = setInterval(() => {
+                auth.prune()
+                void syncSessionMirror()
+            }, PRUNE_INTERVAL_MS)
             pruneTimer.unref()
             logger.info(
                 { url: gatewayUrl(), routes: routeTable.list().length, auth: config.auth.enabled },
@@ -629,6 +811,10 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             if (pruneTimer !== null) {
                 clearInterval(pruneTimer)
                 pruneTimer = null
+            }
+            if (sessionMirrorRetryTimer !== null) {
+                clearTimeout(sessionMirrorRetryTimer)
+                sessionMirrorRetryTimer = null
             }
             const current = server
             server = null

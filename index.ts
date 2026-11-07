@@ -61,6 +61,7 @@ export function setup() {
                 auth,
                 logger: api.logger,
                 readText: (path) => api.fs.readText(path),
+                writeText: (path, text) => api.fs.writeText(path, text),
             })
             await handle.start()
             gateway = handle
