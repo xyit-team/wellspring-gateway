@@ -1,0 +1,106 @@
+name: publish-npm
+
+# 发布到 npm：@xyit-team/wellspring-gateway@x.y.z
+# 认证走 npm Trusted Publishing（OIDC），仓库里不存 token
+# 当前只有占位实现：无依赖、无构建步骤，直接打包发布
+on:
+    push:
+        tags: ["v*"]
+    # 失败重跑：Actions 页面 Run workflow，填已有 tag
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: 要发布的 tag（例如 v0.1.1）
+                required: true
+                type: string
+            dry-run:
+                description: 只演练打包，不真正发布
+                type: boolean
+                default: true
+
+concurrency:
+    group: publish-npm-${{ github.ref_name || inputs.tag }}
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  ref: ${{ inputs.tag || github.ref }}
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+
+            - name: 检查 OIDC 是否可用
+              run: |
+                  set -euo pipefail
+                  if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                    echo "没有 id-token: write 权限，拿不到 OIDC token，无法走 Trusted Publishing。"
+                    exit 1
+                  fi
+
+            - name: 确认 npm 支持 Trusted Publishing（>= 11.5.1）
+              run: |
+                  set -euo pipefail
+                  required="11.5.1"
+                  current="$(npm --version)"
+                  if [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n1)" != "$required" ]; then
+                    npm install -g "npm@^11.15.0"
+                  fi
+                  echo "node $(node -v)，npm $(npm --version)"
+
+            - name: 核对标签与 package.json 的版本
+              env:
+                  TAG: ${{ inputs.tag || github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  version="v$(node -p "require('./package.json').version")"
+                  if [ "$TAG" != "$version" ]; then
+                    echo "标签是 $TAG，但 package.json 里是 $version。"
+                    exit 1
+                  fi
+
+            - name: 该版本是否已经发布
+              id: exists
+              run: |
+                  set -euo pipefail
+                  name="$(node -p "require('./package.json').name")"
+                  version="$(node -p "require('./package.json').version")"
+                  if npm view "${name}@${version}" version >/dev/null 2>&1; then
+                    echo "${name}@${version} 已经发布过，跳过"
+                    echo "skip=1" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "${name}@${version} 还没发布，继续"
+                  fi
+
+            - name: 演练（不发布）
+              if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run && steps.exists.outputs.skip != '1' }}
+              run: npm publish --dry-run --access public
+
+            - name: 发布
+              if: ${{ (github.event_name == 'push' || !inputs.dry-run) && steps.exists.outputs.skip != '1' }}
+              run: npm publish --access public --provenance
+
+            - name: 校验发布结果
+              if: ${{ (github.event_name == 'push' || !inputs.dry-run) && steps.exists.outputs.skip != '1' }}
+              run: |
+                  set -euo pipefail
+                  name="$(node -p "require('./package.json').name")"
+                  version="$(node -p "require('./package.json').version")"
+                  for attempt in $(seq 1 18); do
+                    if published="$(npm view "${name}@${version}" version 2>/dev/null)"; then
+                      echo "npm 上已有 ${name}@${published}（第 ${attempt} 次查询）"
+                      exit 0
+                    fi
+                    echo "第 ${attempt} 次还查不到，等 10s"
+                    sleep 10
+                  done
+                  echo "发布命令成功，但 ${name}@${version} 查不到"
+                  exit 1
