@@ -19,7 +19,7 @@ import type { Duplex } from "node:stream"
 import { AuthStore, GATEWAY_USER, SESSION_COOKIE, passwordProblem } from "./auth.ts"
 import { parseTarget, upstreamPath, type GatewayConfig } from "./config.ts"
 import { GATEWAY_VERSION } from "./version.ts"
-import { accountPage, loginPage, messagePage, passwordPage } from "./pages.ts"
+import { PAGE_SCRIPT_HASH, accountPage, loginPage, messagePage, passwordPage } from "./pages.ts"
 import type { GatewayUpstreamInfo } from "./protocol.ts"
 import {
     forwardRequest,
@@ -64,8 +64,28 @@ const SECURITY_HEADERS = {
     "referrer-policy": "same-origin",
 } as const
 
-const PAGE_CSP =
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+/*
+ * form-action 同时校验表单 POST 之后的重定向目标（Chrome/Edge）
+ * 登录回跳跨端口时要把目标源加进 form-action，否则登录后页面不跳转
+ */
+function formActionOriginOf(target: string): string | null {
+    if (target.startsWith("/")) {
+        return null
+    }
+    try {
+        return new URL(target).origin
+    } catch {
+        return null
+    }
+}
+
+function pageCsp(formActionOrigin?: string | null): string {
+    const formAction =
+        formActionOrigin === undefined || formActionOrigin === null
+            ? "'self'"
+            : `'self' ${formActionOrigin}`
+    return `default-src 'none'; script-src '${PAGE_SCRIPT_HASH}'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`
+}
 
 export interface GatewayLogger extends ProxyLogger {
     info(fields: Record<string, unknown>, message: string): void
@@ -140,13 +160,14 @@ function htmlResponse(
     status: number,
     html: string,
     extraHeaders: Record<string, string> = {},
+    csp: string = pageCsp(),
 ): void {
     const body = Buffer.from(html, "utf8")
     res.writeHead(status, {
         "content-type": "text/html; charset=utf-8",
         "content-length": String(body.length),
         "cache-control": "no-store",
-        "content-security-policy": PAGE_CSP,
+        "content-security-policy": csp,
         ...SECURITY_HEADERS,
         ...extraHeaders,
     })
@@ -312,13 +333,17 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         htmlResponse(res, status, messagePage({ title, message: text }))
     }
 
-    function loginTarget(url: URL, form: URLSearchParams | null, req: IncomingMessage): string {
-        const raw =
+    function loginTargetRaw(url: URL, form: URLSearchParams | null): string | null {
+        return (
             form?.get("redirect") ??
             form?.get("next") ??
             url.searchParams.get("redirect") ??
             url.searchParams.get("next")
-        return resolveRedirect(raw, redirectContext(req))
+        )
+    }
+
+    function loginTarget(url: URL, form: URLSearchParams | null, req: IncomingMessage): string {
+        return resolveRedirect(loginTargetRaw(url, form), redirectContext(req))
     }
 
     async function setLoginCookie(
@@ -410,8 +435,12 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             return
         }
         const form = await readForm(req)
-        const next = loginTarget(url, form, req)
+        const rawTarget = loginTargetRaw(url, form)
+        const next = resolveRedirect(rawTarget, redirectContext(req))
         const ip = remoteAddressOf(req)
+        if (rawTarget !== null && rawTarget !== "" && next === "/") {
+            logger.warn({ ip, rawTarget, host: req.headers.host ?? "" }, "登录回跳目标被拒绝")
+        }
 
         if (!auth.hasPassword) {
             const password = form.get("password") ?? ""
@@ -428,6 +457,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             await auth.setPassword(password)
             await setLoginCookie(res)
             logger.info({ ip }, "管理密码已设置")
+            logger.info({ ip, target: next }, "登录成功")
             redirect(res, next)
             return
         }
@@ -446,6 +476,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         }
         auth.clearFailures(ip)
         await setLoginCookie(res)
+        logger.info({ ip, target: next }, "登录成功")
         redirect(res, next)
     }
 
@@ -570,7 +601,12 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                     message(res, 405, "不支持的请求", "GET / POST")
                     return
                 }
-                const target = loginTarget(url, null, req)
+                const rawTarget = loginTargetRaw(url, null)
+                const target = resolveRedirect(rawTarget, redirectContext(req))
+                logger.info(
+                    { host: req.headers.host ?? "", rawTarget, target, authorized },
+                    "登录页",
+                )
                 /* 已登录时直接回跳：其他端口的服务跳来登录后不会再停在登录页 */
                 if (authorized) {
                     redirect(res, target)
@@ -586,6 +622,8 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                         ...(hasRedirect ? { redirect: target } : {}),
                         ...(hasNext && !hasRedirect ? { next: target } : {}),
                     }),
+                    {},
+                    pageCsp(formActionOriginOf(target)),
                 )
                 return
             }

@@ -1,8 +1,10 @@
 /*
- * 网关自有页面：登录 / 设置密码 / 修改密码 / 错误页
+ * 网关自有页面：登录 / 设置密码 / 修改密码 / 账户页 / 错误页
  *
- * 页面自包含（内联样式、无脚本），响应头由 server.ts 统一下发
+ * 页面自包含（内联样式），诊断脚本内联，CSP 用脚本哈希放行；响应头由 server.ts 统一下发
  */
+
+import { createHash } from "node:crypto"
 
 export function escapeHtml(value: string): string {
     return value
@@ -12,6 +14,45 @@ export function escapeHtml(value: string): string {
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;")
 }
+
+/* 浏览器 console 诊断日志；内容变化时 CSP 哈希自动跟着变 */
+const DIAGNOSTIC_SCRIPT = `(function () {
+    var prefix = "[wellspring] ";
+    function log(name, data) {
+        if (data === undefined) {
+            console.log(prefix + name);
+        } else {
+            console.log(prefix + name, data);
+        }
+    }
+    log("page", { url: location.href, title: document.title });
+    var form = document.querySelector("form");
+    if (form === null) {
+        return;
+    }
+    log("form", { action: form.getAttribute("action"), method: form.getAttribute("method") });
+    form.addEventListener("submit", function () {
+        var fields = {};
+        var elements = form.elements;
+        for (var index = 0; index < elements.length; index += 1) {
+            var element = elements[index];
+            if (!element.name) {
+                continue;
+            }
+            fields[element.name] = element.name.indexOf("password") >= 0 ? "***" : element.value;
+        }
+        log("submit", fields);
+        log("submit-target", new URL(form.getAttribute("action") || location.href, location.href).href);
+    });
+    window.addEventListener("pageshow", function (event) {
+        log("pageshow", { persisted: event.persisted });
+    });
+    window.addEventListener("error", function (event) {
+        log("error", String(event.message));
+    });
+})();`
+
+export const PAGE_SCRIPT_HASH = `sha256-${createHash("sha256").update(DIAGNOSTIC_SCRIPT, "utf8").digest("base64")}`
 
 const STYLE = `
 :root { color-scheme: light dark; }
@@ -114,6 +155,7 @@ function layout(title: string, body: string): string {
 ${body}
 <footer>Wellspring Gateway</footer>
 </main>
+<script>${DIAGNOSTIC_SCRIPT}</script>
 </body>
 </html>
 `

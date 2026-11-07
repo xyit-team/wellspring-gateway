@@ -1,6 +1,6 @@
 {
     "name": "@xyit-team/wellspring-gateway",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "description": "Wellspring 网关插件：统一入口、路由、TLS 与统一登录",
     "license": "MIT",
     "repository": {

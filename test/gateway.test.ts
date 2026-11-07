@@ -530,6 +530,26 @@ test("根路径：未登录跳登录页，登录后显示账户页且不再列�
     assert.doesNotMatch(html, /\/raw/)
 })
 
+test("登录页 CSP：按回跳目标放行 form-action，并放行诊断脚本哈希", async () => {
+    const isolated = await startGateway([])
+    try {
+        const scoped = await fetch(
+            `${isolated.gateway.url}/login?redirect=${encodeURIComponent("127.0.0.1:8787/page")}`,
+        )
+        const csp = scoped.headers.get("content-security-policy") ?? ""
+        assert.match(csp, /form-action 'self' http:\/\/127\.0\.0\.1:8787/)
+        assert.match(csp, /script-src 'sha256-[A-Za-z0-9+/=]+'/)
+        assert.match(await scoped.text(), /log\("page"/)
+
+        const plain = await fetch(`${isolated.gateway.url}/login`)
+        const plainCsp = plain.headers.get("content-security-policy") ?? ""
+        assert.match(plainCsp, /form-action 'self';/)
+        assert.doesNotMatch(plainCsp, /form-action 'self' http/)
+    } finally {
+        await isolated.close()
+    }
+})
+
 test("登录 redirect 参数：本机地址回跳，公网地址拒绝", async () => {
     const isolated = await startGateway([route("/web", upstream.url)])
     try {
@@ -591,7 +611,7 @@ test("状态接口：未登录跳转登录页，登录后返回路由与上游�
         version: string
         routes: Array<Record<string, unknown>>
     }
-    assert.equal(payload.version, "0.5.0")
+    assert.equal(payload.version, "0.5.1")
     assert.ok(
         payload.routes.some(
             (route) => route["prefix"] === "/web" && route["upstream"] === "up",
