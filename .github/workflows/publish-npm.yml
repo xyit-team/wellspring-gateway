@@ -95,7 +95,14 @@ jobs:
 
             - name: 发布
               if: ${{ (github.event_name == 'push' || !inputs.dry-run) && steps.exists.outputs.skip != '1' }}
-              run: npm publish --access public --provenance
+              # provenance 依赖 npm 的 transparency log；TLOG 5xx 时回退为不带 provenance 发布
+              run: |
+                  set -euo pipefail
+                  if npm publish --access public --provenance; then
+                    exit 0
+                  fi
+                  echo "带 provenance 发布失败，回退为不带 provenance 重试"
+                  npm publish --access public
 
             - name: 校验发布结果
               if: ${{ (github.event_name == 'push' || !inputs.dry-run) && steps.exists.outputs.skip != '1' }}
