@@ -12,6 +12,10 @@ export interface RouteConfig {
     readonly target: string
     /** 转发前去掉前缀，默认 true */
     readonly stripPrefix: boolean
+    /** 免登录路由，默认 false */
+    readonly public: boolean
+    /** 该路由的上游空闲超时；缺省用全局配置 */
+    readonly timeoutMs: number | null
 }
 
 export interface TlsConfig {
@@ -77,7 +81,7 @@ function integerField(value: unknown, min: number, max: number): number | null {
         : null
 }
 
-function normalizePrefix(value: string): string | null {
+export function normalizeRoutePrefix(value: string): string | null {
     if (!value.startsWith("/")) {
         return null
     }
@@ -122,7 +126,7 @@ function parseRoutes(value: unknown, warnings: string[]): readonly RouteConfig[]
             warnings.push(`routes[${index}].prefix 缺失`)
             continue
         }
-        const prefix = normalizePrefix(rawPrefix)
+        const prefix = normalizeRoutePrefix(rawPrefix)
         if (prefix === null) {
             warnings.push(`routes[${index}].prefix 必须以 / 开头：${rawPrefix}`)
             continue
@@ -136,7 +140,22 @@ function parseRoutes(value: unknown, warnings: string[]): readonly RouteConfig[]
             warnings.push(`routes[${index}].stripPrefix 不是布尔值`)
             continue
         }
-        routes.push({ prefix, target: rawTarget, stripPrefix })
+        const rawPublic = item["public"]
+        const isPublic = rawPublic === undefined || rawPublic === null ? false : rawPublic
+        if (typeof isPublic !== "boolean") {
+            warnings.push(`routes[${index}].public 不是布尔值`)
+            continue
+        }
+        const rawTimeout = item["timeoutMs"]
+        const timeoutMs =
+            rawTimeout === undefined || rawTimeout === null
+                ? null
+                : integerField(rawTimeout, 1, 24 * 60 * 60 * 1000)
+        if (rawTimeout !== undefined && rawTimeout !== null && timeoutMs === null) {
+            warnings.push(`routes[${index}].timeoutMs 不合法`)
+            continue
+        }
+        routes.push({ prefix, target: rawTarget, stripPrefix, public: isPublic, timeoutMs })
     }
     return routes
 }

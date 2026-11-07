@@ -10,6 +10,14 @@ import {
     type RouteConfig,
 } from "../src/config.ts"
 
+function route(
+    prefix: string,
+    target: string,
+    stripPrefix = true,
+): RouteConfig {
+    return { prefix, target, stripPrefix, public: false, timeoutMs: null }
+}
+
 test("默认配置", () => {
     const { config, warnings } = parseGatewayConfig({})
     assert.deepEqual(config, DEFAULT_GATEWAY_CONFIG)
@@ -44,10 +52,24 @@ test("路由解析：保留合法项，丢弃非法项", () => {
         ],
     })
     assert.deepEqual(config.routes, [
-        { prefix: "/web", target: "http://127.0.0.1:8787", stripPrefix: true },
-        { prefix: "/raw", target: "http://127.0.0.1:8789", stripPrefix: false },
+        { prefix: "/web", target: "http://127.0.0.1:8787", stripPrefix: true, public: false, timeoutMs: null },
+        { prefix: "/raw", target: "http://127.0.0.1:8789", stripPrefix: false, public: false, timeoutMs: null },
     ])
     assert.equal(warnings.length, 3)
+})
+
+test("路由项支持 public 与 timeoutMs", () => {
+    const { config, warnings } = parseGatewayConfig({
+        routes: [
+            { prefix: "/api", target: "http://127.0.0.1:1", public: true, timeoutMs: 5_000 },
+            { prefix: "/bad", target: "http://127.0.0.1:2", timeoutMs: 0 },
+            { prefix: "/bad2", target: "http://127.0.0.1:3", public: "yes" },
+        ],
+    })
+    assert.deepEqual(config.routes, [
+        { prefix: "/api", target: "http://127.0.0.1:1", stripPrefix: true, public: true, timeoutMs: 5_000 },
+    ])
+    assert.equal(warnings.length, 2)
 })
 
 test("parseTarget：只接受 http(s)", () => {
@@ -59,9 +81,9 @@ test("parseTarget：只接受 http(s)", () => {
 
 test("matchRoute：最长前缀与段边界", () => {
     const routes: RouteConfig[] = [
-        { prefix: "/", target: "http://127.0.0.1:1", stripPrefix: false },
-        { prefix: "/web", target: "http://127.0.0.1:2", stripPrefix: true },
-        { prefix: "/web/api", target: "http://127.0.0.1:3", stripPrefix: true },
+        route("/", "http://127.0.0.1:1", false),
+        route("/web", "http://127.0.0.1:2"),
+        route("/web/api", "http://127.0.0.1:3"),
     ]
     assert.equal(matchRoute(routes, "/web/api/x")?.rest, "/x")
     assert.equal(matchRoute(routes, "/web/api/x")?.route.target, "http://127.0.0.1:3")
@@ -72,8 +94,8 @@ test("matchRoute：最长前缀与段边界", () => {
 })
 
 test("upstreamPath：stripPrefix 开关", () => {
-    const strip: RouteConfig = { prefix: "/web", target: "http://x", stripPrefix: true }
-    const keep: RouteConfig = { prefix: "/web", target: "http://x", stripPrefix: false }
+    const strip: RouteConfig = route("/web", "http://x")
+    const keep: RouteConfig = route("/web", "http://x", false)
     assert.equal(upstreamPath(strip, "/hello", "/web/hello"), "/hello")
     assert.equal(upstreamPath(strip, "/", "/web"), "/")
     assert.equal(upstreamPath(keep, "/hello", "/web/hello"), "/web/hello")

@@ -1,10 +1,11 @@
 /*
  * 网关服务
  *
- * 单端口对外：自有端点（登录、密码、健康检查）先处理，其余按前缀路由反代到上游
- * 鉴权开启时，未登录请求重定向到 /login（HTML）或返回 401（其它）
+ * 单端口对外：自有端点（登录、密码、健康检查、状态、首页）先处理，其余按路由反代到上游
+ * 鉴权开启时，未登录请求重定向到 /login（HTML）或返回 401（其它）；public 路由免登录
  */
 
+import { randomUUID } from "node:crypto"
 import {
     createServer as createHttpServer,
     type IncomingMessage,
@@ -12,30 +13,43 @@ import {
     type ServerResponse,
 } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
-import type { AddressInfo } from "node:net"
+import { connect as netConnect, type AddressInfo } from "node:net"
 import type { Duplex } from "node:stream"
 
 import { AuthStore, SESSION_COOKIE, passwordProblem } from "./auth.ts"
-import { matchRoute, parseTarget, upstreamPath, type GatewayConfig } from "./config.ts"
-import { loginPage, messagePage, passwordPage } from "./pages.ts"
+import { parseTarget, upstreamPath, type GatewayConfig } from "./config.ts"
+import { GATEWAY_VERSION } from "./version.ts"
+import { homePage, loginPage, messagePage, passwordPage } from "./pages.ts"
+import type { GatewayUpstreamInfo } from "./protocol.ts"
 import {
     forwardRequest,
     forwardUpgrade,
     sessionTokenFrom,
     type ProxyLogger,
 } from "./proxy.ts"
+import { RouteTable, type AddUpstreamResult, type RouteEntry } from "./routes.ts"
 
 const BODY_LIMIT_BYTES = 16 * 1024
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000
+const PROBE_TIMEOUT_MS = 500
+const PROBE_CACHE_MS = 3000
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
 
-const OWN_PATHS = new Set(["/login", "/logout", "/__gateway/password", "/__gateway/health"])
+const OWN_PATHS = new Set([
+    "/login",
+    "/logout",
+    "/__gateway/password",
+    "/__gateway/health",
+    "/__gateway/status",
+])
 
 const SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "referrer-policy": "same-origin",
 } as const
 
-const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+const PAGE_CSP =
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
 export interface GatewayLogger extends ProxyLogger {
     info(fields: Record<string, unknown>, message: string): void
@@ -54,8 +68,13 @@ export interface GatewayHandle {
     readonly url: string
     readonly secure: boolean
     readonly port: number
+    readonly version: string
     start(): Promise<void>
     close(): Promise<void>
+    /** 插件注册上游；返回失败原因，由调用方决定是否回给注册方 */
+    addUpstream(input: unknown): AddUpstreamResult
+    removeUpstream(name: string): boolean
+    listUpstreams(): GatewayUpstreamInfo[]
 }
 
 class HttpError extends Error {
@@ -82,6 +101,15 @@ function cookieToken(req: IncomingMessage): string | undefined {
 function acceptsHtml(req: IncomingMessage): boolean {
     const accept = req.headers.accept ?? ""
     return accept.includes("text/html") || accept.includes("*/*")
+}
+
+function requestIdOf(req: IncomingMessage): string {
+    const header = req.headers["x-request-id"]
+    const provided = typeof header === "string" ? header : Array.isArray(header) ? header[0] : undefined
+    if (provided !== undefined && REQUEST_ID_PATTERN.test(provided)) {
+        return provided
+    }
+    return randomUUID().replaceAll("-", "").slice(0, 16)
 }
 
 /** 只接受站内绝对路径，防开放重定向 */
@@ -159,12 +187,32 @@ function passwordErrorMessage(problem: "too-short" | "too-long"): string {
     return problem === "too-short" ? "密码长度至少 6 位" : "密码长度最多 200 位"
 }
 
+function upstreamInfo(entry: RouteEntry): GatewayUpstreamInfo {
+    return {
+        name: entry.name,
+        prefix: entry.config.prefix,
+        target: entry.config.target,
+        stripPrefix: entry.config.stripPrefix,
+        public: entry.config.public,
+        timeoutMs: entry.config.timeoutMs,
+        source: entry.source,
+    }
+}
+
 export function createGateway(env: GatewayEnv): GatewayHandle {
     const { config, auth, logger } = env
     const secure = config.tls !== null
+    const routeTable = new RouteTable(config.routes)
+    const startedAt = Date.now()
+    const probeCache = new Map<string, { ok: boolean; checkedAt: number }>()
     let server: Server | null = null
     let actualPort = config.port
     let pruneTimer: ReturnType<typeof setInterval> | null = null
+
+    function gatewayUrl(): string {
+        const host = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host
+        return `${secure ? "https" : "http"}://${host}:${actualPort}`
+    }
 
     const sessionCookie = (token: string, maxAgeSeconds: number): string =>
         `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${
@@ -174,12 +222,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
     const clearSessionCookie = (): string =>
         `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`
 
-    function message(
-        res: ServerResponse,
-        status: number,
-        title: string,
-        text: string,
-    ): void {
+    function message(res: ServerResponse, status: number, title: string, text: string): void {
         htmlResponse(res, status, messagePage({ title, message: text }))
     }
 
@@ -191,8 +234,28 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         const session = auth.createSession()
         res.setHeader(
             "set-cookie",
-            sessionCookie(session.token, Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000))),
+            sessionCookie(
+                session.token,
+                Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000)),
+            ),
         )
+    }
+
+    function isAuthorized(req: IncomingMessage): boolean {
+        if (!config.auth.enabled) {
+            return true
+        }
+        return auth.validateSession(cookieToken(req))
+    }
+
+    function unauthorized(req: IncomingMessage, res: ServerResponse, url: URL): void {
+        const method = req.method ?? "GET"
+        if (acceptsHtml(req) && (method === "GET" || method === "HEAD")) {
+            const next = encodeURIComponent(`${url.pathname}${url.search}`)
+            redirect(res, `/login?next=${next}`)
+            return
+        }
+        jsonResponse(res, 401, { error: "unauthorized" })
     }
 
     async function handleLogin(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -240,10 +303,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         redirect(res, next)
     }
 
-    async function handlePasswordChange(
-        req: IncomingMessage,
-        res: ServerResponse,
-    ): Promise<void> {
+    async function handlePasswordChange(req: IncomingMessage, res: ServerResponse): Promise<void> {
         if (!sameOrigin(req, secure)) {
             message(res, 403, "请求被拒绝", "Origin 校验失败")
             return
@@ -271,23 +331,73 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         redirect(res, "/")
     }
 
-    function isAuthorized(req: IncomingMessage): boolean {
-        if (!config.auth.enabled) {
-            return true
+    async function probeUpstream(target: URL): Promise<boolean> {
+        const key = target.href
+        const cached = probeCache.get(key)
+        if (cached !== undefined && Date.now() - cached.checkedAt < PROBE_CACHE_MS) {
+            return cached.ok
         }
-        return auth.validateSession(cookieToken(req))
+        const port = target.port === "" ? (target.protocol === "https:" ? 443 : 80) : Number(target.port)
+        const ok = await new Promise<boolean>((resolve) => {
+            const socket = netConnect({ host: target.hostname, port })
+            const timer = setTimeout(() => {
+                socket.destroy()
+                resolve(false)
+            }, PROBE_TIMEOUT_MS)
+            socket.once("connect", () => {
+                clearTimeout(timer)
+                socket.destroy()
+                resolve(true)
+            })
+            socket.once("error", () => {
+                clearTimeout(timer)
+                resolve(false)
+            })
+        })
+        probeCache.set(key, { ok, checkedAt: Date.now() })
+        return ok
+    }
+
+    async function statusPayload(): Promise<Record<string, unknown>> {
+        const routes = await Promise.all(
+            routeTable.list().map(async (entry) => {
+                const target = parseTarget(entry.config.target)
+                const reachable = target === null ? false : await probeUpstream(target)
+                return { ...upstreamInfo(entry), upstream: reachable ? "up" : "down" }
+            }),
+        )
+        return {
+            version: GATEWAY_VERSION,
+            url: gatewayUrl(),
+            secure,
+            uptimeMs: Date.now() - startedAt,
+            auth: { enabled: config.auth.enabled, hasPassword: auth.hasPassword },
+            routes,
+        }
     }
 
     async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-        const startedAt = Date.now()
+        const requestStart = Date.now()
         const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`)
+        const requestId = requestIdOf(req)
+        res.setHeader("x-request-id", requestId)
         let upstream: string | null = null
+        let actor: string | null = null
         try {
             const path = url.pathname
             const method = req.method ?? "GET"
+            const authorized = isAuthorized(req)
 
             if (path === "/__gateway/health") {
                 jsonResponse(res, 200, { status: "ok", auth: config.auth.enabled })
+                return
+            }
+            if (path === "/__gateway/status") {
+                if (config.auth.enabled && !authorized) {
+                    unauthorized(req, res, url)
+                    return
+                }
+                jsonResponse(res, 200, await statusPayload())
                 return
             }
             if (path === "/login") {
@@ -317,7 +427,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 return
             }
             if (path === "/__gateway/password") {
-                if (!isAuthorized(req)) {
+                if (!authorized) {
                     redirect(res, "/login?next=%2F__gateway%2Fpassword")
                     return
                 }
@@ -329,35 +439,50 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 return
             }
 
-            const match = matchRoute(config.routes, path)
-            if (!isAuthorized(req)) {
-                if (acceptsHtml(req) && (method === "GET" || method === "HEAD")) {
-                    const next = encodeURIComponent(`${path}${url.search}`)
-                    redirect(res, `/login?next=${next}`)
+            const match = routeTable.match(path)
+            if (match === null) {
+                if (!authorized) {
+                    unauthorized(req, res, url)
                     return
                 }
-                jsonResponse(res, 401, { error: "unauthorized" })
-                return
-            }
-            if (match === null) {
+                if (path === "/" || path === "") {
+                    htmlResponse(
+                        res,
+                        200,
+                        homePage({ routes: routeTable.list().map((entry) => ({
+                            prefix: entry.config.prefix,
+                            name: entry.name,
+                            source: entry.source,
+                        })) }),
+                    )
+                    return
+                }
                 message(res, 404, "页面不存在", `${method} ${path}`)
                 return
             }
-            const target = parseTarget(match.route.target)
+
+            const entry = match.entry
+            if (!entry.config.public && !authorized) {
+                unauthorized(req, res, url)
+                return
+            }
+            actor = config.auth.enabled && authorized ? "admin" : null
+            const target = parseTarget(entry.config.target)
             if (target === null) {
-                message(res, 502, "上游配置错误", match.route.target)
+                message(res, 502, "上游配置错误", entry.config.target)
                 return
             }
             upstream = target.href
-            const pathValue = `${upstreamPath(match.route, match.rest, path)}${url.search}`
+            const pathValue = `${upstreamPath(entry.config, match.rest, path)}${url.search}`
             await forwardRequest(req, res, {
                 target,
                 upstreamPath: pathValue,
-                prefix: match.route.prefix,
+                prefix: entry.config.prefix,
                 remoteAddress: remoteAddressOf(req),
                 secure,
-                user: config.auth.enabled ? "admin" : null,
-                timeoutMs: config.upstreamTimeoutMs,
+                user: actor,
+                timeoutMs: entry.config.timeoutMs ?? config.upstreamTimeoutMs,
+                requestId,
                 logger,
             })
         } catch (error) {
@@ -367,7 +492,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 }
                 return
             }
-            logger.error({ error: errorText(error), path: url.pathname }, "网关请求失败")
+            logger.error({ error: errorText(error), path: url.pathname, requestId }, "网关请求失败")
             if (!res.headersSent) {
                 message(res, 500, "网关内部错误", "请求处理失败")
             } else {
@@ -377,11 +502,13 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
             if (config.accessLog) {
                 logger.info(
                     {
+                        requestId,
                         method: req.method ?? "GET",
                         path: url.pathname,
                         status: res.statusCode,
-                        durationMs: Date.now() - startedAt,
+                        durationMs: Date.now() - requestStart,
                         upstream,
+                        user: actor,
                     },
                     "access",
                 )
@@ -392,28 +519,34 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
     function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
         try {
             const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`)
-            if (OWN_PATHS.has(url.pathname) || !isAuthorized(req)) {
-                socket.end("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n")
+            if (OWN_PATHS.has(url.pathname)) {
+                socket.end("HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n")
                 return
             }
-            const match = matchRoute(config.routes, url.pathname)
+            const match = routeTable.match(url.pathname)
             if (match === null) {
                 socket.end("HTTP/1.1 404 Not Found\r\nconnection: close\r\n\r\n")
                 return
             }
-            const target = parseTarget(match.route.target)
+            const authorized = isAuthorized(req)
+            if (!match.entry.config.public && !authorized) {
+                socket.end("HTTP/1.1 401 Unauthorized\r\nconnection: close\r\n\r\n")
+                return
+            }
+            const target = parseTarget(match.entry.config.target)
             if (target === null) {
                 socket.end("HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n")
                 return
             }
             forwardUpgrade(req, socket, head, {
                 target,
-                upstreamPath: `${upstreamPath(match.route, match.rest, url.pathname)}${url.search}`,
-                prefix: match.route.prefix,
+                upstreamPath: `${upstreamPath(match.entry.config, match.rest, url.pathname)}${url.search}`,
+                prefix: match.entry.config.prefix,
                 remoteAddress: remoteAddressOf(req),
                 secure,
-                user: config.auth.enabled ? "admin" : null,
-                timeoutMs: config.upstreamTimeoutMs,
+                user: config.auth.enabled && authorized ? "admin" : null,
+                timeoutMs: match.entry.config.timeoutMs ?? config.upstreamTimeoutMs,
+                requestId: requestIdOf(req),
                 logger,
             })
         } catch (error) {
@@ -436,8 +569,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
 
     return {
         get url(): string {
-            const host = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host
-            return `${secure ? "https" : "http"}://${host}:${actualPort}`
+            return gatewayUrl()
         },
         get secure(): boolean {
             return secure
@@ -445,6 +577,7 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
         get port(): number {
             return actualPort
         },
+        version: GATEWAY_VERSION,
         async start(): Promise<void> {
             if (server !== null) {
                 return
@@ -481,10 +614,16 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 current.listen(config.port, config.host)
             })
             const address = current.address()
-            actualPort = typeof address === "object" && address !== null ? (address as AddressInfo).port : config.port
+            actualPort =
+                typeof address === "object" && address !== null
+                    ? (address as AddressInfo).port
+                    : config.port
             pruneTimer = setInterval(() => auth.prune(), PRUNE_INTERVAL_MS)
             pruneTimer.unref()
-            logger.info({ url: this.url, routes: config.routes.length, auth: config.auth.enabled }, "网关已启动")
+            logger.info(
+                { url: gatewayUrl(), routes: routeTable.list().length, auth: config.auth.enabled },
+                "网关已启动",
+            )
         },
         async close(): Promise<void> {
             if (pruneTimer !== null) {
@@ -505,6 +644,33 @@ export function createGateway(env: GatewayEnv): GatewayHandle {
                 }, 800)
                 force.unref()
             })
+        },
+        addUpstream(input: unknown): AddUpstreamResult {
+            const result = routeTable.add(input)
+            if (!result.ok) {
+                logger.warn({ error: result.error }, "上游注册失败")
+                return result
+            }
+            logger.info(
+                {
+                    name: result.entry.name,
+                    prefix: result.entry.config.prefix,
+                    target: result.entry.config.target,
+                    replaced: result.replaced,
+                },
+                "上游已注册",
+            )
+            return result
+        },
+        removeUpstream(name: string): boolean {
+            const removed = routeTable.remove(name)
+            if (removed) {
+                logger.info({ name }, "上游已注销")
+            }
+            return removed
+        },
+        listUpstreams(): GatewayUpstreamInfo[] {
+            return routeTable.list().map(upstreamInfo)
         },
     }
 }

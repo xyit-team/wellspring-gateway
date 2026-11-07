@@ -67,6 +67,26 @@ button {
     color: #b91c1c;
 }
 footer { margin-top: 18px; font-size: 12px; color: #a1a1aa; text-align: center; }
+ul.routes { margin: 18px 0 0; padding: 0; list-style: none; }
+ul.routes li + li { margin-top: 8px; }
+ul.routes a {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    color: inherit;
+    text-decoration: none;
+    font-size: 14px;
+}
+ul.routes a:hover { border-color: #a1a1aa; }
+ul.routes span.source { font-size: 12px; color: #a1a1aa; }
+@media (prefers-color-scheme: dark) {
+    ul.routes a { border-color: #27272a; }
+    ul.routes a:hover { border-color: #52525b; }
+}
 @media (prefers-color-scheme: dark) {
     body { background: #09090b; color: #fafafa; }
     main { background: #18181b; border-color: #27272a; box-shadow: none; }
@@ -176,5 +196,34 @@ export function messagePage(options: MessagePageOptions): string {
         options.title,
         `<h1>${escapeHtml(options.title)}</h1>
 <p class="hint">${escapeHtml(options.message)}</p>`,
+    )
+}
+
+export interface HomeRouteLink {
+    readonly prefix: string
+    readonly name: string | null
+    readonly source: "config" | "plugin"
+}
+
+export interface HomePageOptions {
+    readonly routes: readonly HomeRouteLink[]
+}
+
+export function homePage(options: HomePageOptions): string {
+    const items =
+        options.routes.length === 0
+            ? `<p class="hint">暂无已注册服务</p>`
+            : `<ul class="routes">${options.routes
+                  .map((route) => {
+                      const label = route.name ?? route.prefix
+                      const source = route.source === "config" ? "配置" : "插件"
+                      return `<li><a href="${escapeHtml(route.prefix === "/" ? "/" : route.prefix.replace(/\/+$/, "") + "/")}"><span>${escapeHtml(label)}</span><span class="source">${escapeHtml(route.prefix)} · ${source}</span></a></li>`
+                  })
+                  .join("")}</ul>`
+    return layout(
+        "Wellspring",
+        `<h1>Wellspring</h1>
+<p class="hint">选择一个服务</p>
+${items}`,
     )
 }

@@ -37,6 +37,8 @@ export interface ForwardOptions {
     /** 已通过鉴权的用户标识；auth 关闭时为 null */
     readonly user: string | null
     readonly timeoutMs: number
+    /** 网关生成的请求 id，透传给上游 */
+    readonly requestId: string
     readonly logger?: ProxyLogger
 }
 
@@ -103,6 +105,7 @@ function forwardedHeaders(req: IncomingMessage, options: ForwardOptions): Record
     headers["x-forwarded-host"] = String(req.headers.host ?? "")
     headers["x-forwarded-prefix"] = options.prefix
     headers["x-wellspring-gateway"] = "1"
+    headers["x-request-id"] = options.requestId
     if (options.user !== null) {
         headers["x-wellspring-user"] = options.user
     }
@@ -113,6 +116,10 @@ function responseHeaders(headers: IncomingMessage["headers"]): Record<string, st
     const result: Record<string, string | string[]> = {}
     for (const [name, value] of Object.entries(headers)) {
         if (value === undefined || HOP_BY_HOP.has(name.toLowerCase())) {
+            continue
+        }
+        /* x-request-id 用网关的，不用上游回显 */
+        if (name.toLowerCase() === "x-request-id") {
             continue
         }
         /* set-cookie 需要逐条下发 */

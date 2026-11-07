@@ -42,7 +42,8 @@ wellspring start
     "tls": { "certFile": "cert.pem", "keyFile": "key.pem" },
     "routes": [
         { "prefix": "/web", "target": "http://127.0.0.1:8787" },
-        { "prefix": "/code", "target": "http://127.0.0.1:8788", "stripPrefix": false }
+        { "prefix": "/code", "target": "http://127.0.0.1:8788", "stripPrefix": false },
+        { "prefix": "/healthz", "target": "http://127.0.0.1:8787", "public": true, "timeoutMs": 5000 }
     ],
     "auth": { "enabled": true, "sessionHours": 168, "maxAttempts": 5, "windowMs": 60000 },
     "upstreamTimeoutMs": 120000,
@@ -59,6 +60,8 @@ wellspring start
 | `routes[].prefix`   | 必填        | 外部路径前缀，`/` 为兜底                                 |
 | `routes[].target`   | 必填        | 上游地址，只接受 `http(s)://`                            |
 | `routes[].stripPrefix` | `true`   | 转发前去掉前缀；`false` 时上游收到完整路径               |
+| `routes[].public`   | `false`     | 免登录路由；登录状态下仍会带上用户头                     |
+| `routes[].timeoutMs`| 全局值      | 该路由的上游空闲超时覆盖                                 |
 | `auth.enabled`      | `true`      | 统一登录开关                                             |
 | `auth.sessionHours` | `168`       | 会话有效期                                               |
 | `auth.maxAttempts`  | `5`         | 窗口内允许的登录失败次数                                 |
@@ -69,6 +72,50 @@ wellspring start
 路由按前缀最长匹配，按段边界比较：`/web` 匹配 `/web/x`，不匹配 `/web2`。多个路由命中时取最长前缀。
 
 TLS 证书文件放在插件数据目录：`<dataDir>/plugin-data/wellspring-gateway/`。
+
+## 插件运行时注册上游
+
+消费者插件启动时把 loopback 地址注册给网关，不用改配置文件：
+
+```ts
+import { EventEntity, eventBus, onShutdown } from "wellspring/api/host/index.ts"
+
+// setup(): deps: ["wellspring-gateway"]，清单里 hostApi 至少要有 http 与 event
+let handle = null
+onShutdown(async () => {
+    eventBus.publish("wellspring-gateway:upstream:unregister", EventEntity.create({ name: "wellspring-web" }))
+    await handle?.close()
+})
+
+export function setup() {
+    return {
+        deps: ["wellspring-gateway"],
+        init: async (api) => {
+            handle = await api.http.createServer({ host: "127.0.0.1", port: 8787 }, handler)
+            eventBus.publish(
+                "wellspring-gateway:upstream:register",
+                EventEntity.create({
+                    name: "wellspring-web",
+                    prefix: "/web",
+                    target: `http://${handle.host}:${handle.port}`,
+                }),
+            )
+        },
+    }
+}
+```
+
+- 频道：`wellspring-gateway:upstream:register` / `wellspring-gateway:upstream:unregister`；
+  网关每次变化广播 `wellspring-gateway:upstreams` 列表
+- 同名注册覆盖上一条；前缀与静态配置或其它插件冲突时注册失败（网关日志 warning + status 里能看到）
+- 消费者在 `deps` 里声明 `wellspring-gateway`，保证网关先初始化、事件不会丢
+- 消费者崩溃没来得及注销时路由保留到下次重启，`/__gateway/status` 会显示 `upstream: down`
+
+## 首页与诊断
+
+- `GET /`：登录后显示已注册服务列表（路径、来源），可直接点进各入口；配置了 `/` 路由时走代理
+- `GET /__gateway/health`：无需登录，返回 `{ status, auth }`
+- `GET /__gateway/status`：登录后返回版本、运行时长、认证状态、全部路由与上游连通性（TCP 探测，3 秒缓存）
 
 ## 统一登录
 
@@ -89,6 +136,7 @@ TLS 证书文件放在插件数据目录：`<dataDir>/plugin-data/wellspring-gat
 - 丢弃客户端传入的 `x-wellspring-*`、`x-forwarded-*` 头，重新生成
 - `x-wellspring-user: admin`（登录后）、`x-wellspring-gateway: 1`
 - `x-forwarded-for` / `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix`
+- `x-request-id`：网关生成或沿用客户端传来的合法值，访问日志与上游都能看到；响应头回同一个值
 - 去掉网关自己的会话 cookie，其它 cookie 原样转发
 - 请求体与响应体流式透传，不设体积上限（网关不做缓冲）
 - 支持 WebSocket 升级转发（需要登录）
@@ -100,7 +148,7 @@ TLS 证书文件放在插件数据目录：`<dataDir>/plugin-data/wellspring-gat
 - 单用户、单密码；没有多用户与权限模型
 - 会话只存在内存，服务重启后需要重新登录
 - 不做响应压缩、缓存与内容改写（上游自行处理）
-- 上游地址静态配置，没有服务发现；重启上游需要改配置后重启服务
+- 上游来自静态配置或插件注册；消费者崩溃未注销时路由保留到重启（status 显示 down）
 - WebSocket 只做字节流转发，不解析帧
 
 ## 开发

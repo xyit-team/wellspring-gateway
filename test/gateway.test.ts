@@ -17,6 +17,15 @@ const silentLogger = {
     error(): void {},
 }
 
+function route(
+    prefix: string,
+    target: string,
+    stripPrefix = true,
+    extra: Partial<RouteConfig> = {},
+): RouteConfig {
+    return { prefix, target, stripPrefix, public: false, timeoutMs: null, ...extra }
+}
+
 interface MemoryStorage {
     readonly files: Map<string, string>
     readText(path: string): Promise<string | null>
@@ -98,6 +107,13 @@ async function startUpstream(): Promise<Upstream> {
                     res.write("data: b\n\n")
                     res.end()
                 }, 20)
+                return
+            }
+            if (url.startsWith("/slow")) {
+                setTimeout(() => {
+                    res.writeHead(200, { "content-type": "text/plain" })
+                    res.end("slow")
+                }, 300)
                 return
             }
             if (url.startsWith("/fail")) {
@@ -208,8 +224,8 @@ let gateway: GatewayFixture
 before(async () => {
     upstream = await startUpstream()
     gateway = await startGateway([
-        { prefix: "/web", target: upstream.url, stripPrefix: true },
-        { prefix: "/raw", target: upstream.url, stripPrefix: false },
+        route("/web", upstream.url),
+        route("/raw", upstream.url, false),
     ])
 })
 
@@ -325,7 +341,7 @@ test("注销后会话失效", async () => {
 })
 
 test("登录失败限流", async () => {
-    const isolated = await startGateway([{ prefix: "/web", target: upstream.url, stripPrefix: true }])
+    const isolated = await startGateway([route("/web", upstream.url)])
     try {
         await login(isolated.gateway)
         let last = 0
@@ -342,7 +358,7 @@ test("登录失败限流", async () => {
 })
 
 test("登录 next 参数拒绝开放重定向", async () => {
-    const isolated = await startGateway([{ prefix: "/web", target: upstream.url, stripPrefix: true }])
+    const isolated = await startGateway([route("/web", upstream.url)])
     try {
         const response = await postForm(`${isolated.gateway.url}/login`, {
             password: "secret123",
@@ -357,7 +373,7 @@ test("登录 next 参数拒绝开放重定向", async () => {
 })
 
 test("修改密码后旧会话失效", async () => {
-    const isolated = await startGateway([{ prefix: "/web", target: upstream.url, stripPrefix: true }])
+    const isolated = await startGateway([route("/web", upstream.url)])
     try {
         const oldCookie = await login(isolated.gateway)
         const changed = await postForm(
@@ -387,7 +403,7 @@ test("上游不可用返回 502", async () => {
     const port = closed.port
     await closed.close()
     const isolated = await startGateway([
-        { prefix: "/web", target: `http://127.0.0.1:${port}`, stripPrefix: true },
+        route("/web", `http://127.0.0.1:${port}`),
     ])
     try {
         await login(isolated.gateway)
@@ -403,7 +419,7 @@ test("上游不可用返回 502", async () => {
 
 test("鉴权关闭：直接转发且不注入用户", async () => {
     const isolated = await startGateway(
-        [{ prefix: "/web", target: upstream.url, stripPrefix: true }],
+        [route("/web", upstream.url)],
         { auth: { enabled: false } },
     )
     try {
@@ -489,6 +505,136 @@ test("TLS 监听", async () => {
         })
         assert.equal(status, 200)
         assert.equal(isolated.gateway.secure, true)
+    } finally {
+        await isolated.close()
+    }
+})
+
+test("首页列出已注册路由", async () => {
+    const cookie = await login(gateway.gateway)
+    const response = await fetch(`${gateway.gateway.url}/`, { headers: { cookie } })
+    assert.equal(response.status, 200)
+    const html = await response.text()
+    assert.match(html, /\/web/)
+    assert.match(html, /\/raw/)
+})
+
+test("状态接口：未登录跳转登录页，登录后返回路由与上游状态", async () => {
+    const anonymous = await fetch(`${gateway.gateway.url}/__gateway/status`, {
+        redirect: "manual",
+        headers: { accept: "text/html" },
+    })
+    assert.equal(anonymous.status, 302)
+
+    const cookie = await login(gateway.gateway)
+    const response = await fetch(`${gateway.gateway.url}/__gateway/status`, {
+        headers: { cookie },
+    })
+    assert.equal(response.status, 200)
+    const payload = (await response.json()) as {
+        version: string
+        routes: Array<Record<string, unknown>>
+    }
+    assert.equal(payload.version, "0.3.0")
+    assert.ok(
+        payload.routes.some(
+            (route) => route["prefix"] === "/web" && route["upstream"] === "up",
+        ),
+        JSON.stringify(payload),
+    )
+})
+
+test("请求 id：合法值透传，非法值重新生成", async () => {
+    const cookie = await login(gateway.gateway)
+    const echoed = await fetch(`${gateway.gateway.url}/web/json`, {
+        headers: { cookie, "x-request-id": "req-abc.123" },
+    })
+    assert.equal(echoed.headers.get("x-request-id"), "req-abc.123")
+    const recorded = upstream.requests[upstream.requests.length - 1]
+    assert.equal(recorded?.headers["x-request-id"], "req-abc.123")
+
+    const generated = await fetch(`${gateway.gateway.url}/web/json`, {
+        headers: { cookie, "x-request-id": "bad id!" },
+    })
+    assert.match(generated.headers.get("x-request-id") ?? "", /^[0-9a-f]{16}$/)
+})
+
+test("public 路由免登录", async () => {
+    const isolated = await startGateway([
+        route("/pub", upstream.url, true, { public: true }),
+    ])
+    try {
+        const anonymous = await fetch(`${isolated.gateway.url}/pub/json`)
+        assert.equal(anonymous.status, 200)
+        const payload = (await anonymous.json()) as Record<string, unknown>
+        assert.equal(payload["user"], null)
+
+        const cookie = await login(isolated.gateway)
+        const authed = await fetch(`${isolated.gateway.url}/pub/json`, {
+            headers: { cookie },
+        })
+        const authedPayload = (await authed.json()) as Record<string, unknown>
+        assert.equal(authedPayload["user"], "admin")
+    } finally {
+        await isolated.close()
+    }
+})
+
+test("路由级超时覆盖全局", async () => {
+    const isolated = await startGateway([
+        route("/slow", upstream.url, false, { timeoutMs: 50 }),
+    ])
+    try {
+        const cookie = await login(isolated.gateway)
+        const response = await fetch(`${isolated.gateway.url}/slow`, { headers: { cookie } })
+        assert.equal(response.status, 504)
+    } finally {
+        await isolated.close()
+    }
+})
+
+test("插件运行时注册与注销上游", async () => {
+    const isolated = await startGateway([route("/web", upstream.url)])
+    try {
+        const cookie = await login(isolated.gateway)
+        const added = isolated.gateway.addUpstream({
+            name: "wellspring-code",
+            prefix: "/code",
+            target: upstream.url,
+        })
+        assert.equal(added.ok, true)
+        assert.ok(
+            isolated.gateway
+                .listUpstreams()
+                .some((item) => item.name === "wellspring-code" && item.source === "plugin"),
+        )
+        const response = await fetch(`${isolated.gateway.url}/code/json`, {
+            headers: { cookie },
+        })
+        assert.equal(response.status, 200)
+        const payload = (await response.json()) as Record<string, unknown>
+        assert.equal(payload["prefix"], "/code")
+
+        assert.equal(
+            isolated.gateway.addUpstream({
+                name: "other",
+                prefix: "/code",
+                target: upstream.url,
+            }).ok,
+            false,
+        )
+        assert.equal(
+            isolated.gateway.addUpstream({
+                name: "x",
+                prefix: "/web",
+                target: upstream.url,
+            }).ok,
+            false,
+        )
+
+        assert.equal(isolated.gateway.removeUpstream("wellspring-code"), true)
+        const gone = await fetch(`${isolated.gateway.url}/code/json`, { headers: { cookie } })
+        assert.equal(gone.status, 404)
     } finally {
         await isolated.close()
     }
