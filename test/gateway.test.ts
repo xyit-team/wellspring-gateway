@@ -611,7 +611,7 @@ test("状态接口：未登录跳转登录页，登录后返回路由与上游�
         version: string
         routes: Array<Record<string, unknown>>
     }
-    assert.equal(payload.version, "0.5.1")
+    assert.equal(payload.version, "0.6.0")
     assert.ok(
         payload.routes.some(
             (route) => route["prefix"] === "/web" && route["upstream"] === "up",

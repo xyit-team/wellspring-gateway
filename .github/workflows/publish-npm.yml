@@ -1,6 +1,6 @@
 name: publish-npm
 
-# 发布到 npm：@xyit-team/wellspring-gateway@x.y.z
+# 发布到 npm：@xyit/wellspring-gateway@x.y.z
 # 认证走 npm Trusted Publishing（OIDC），仓库里不存 token
 on:
     push:

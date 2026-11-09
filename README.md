@@ -1,4 +1,4 @@
-# @xyit-team/wellspring-gateway
+# @xyit/wellspring-gateway
 
 Wellspring 网关插件：把所有插件服务收敛到一个对外入口——单端口、路径路由、TLS、统一登录与访问日志。
 
@@ -20,9 +20,11 @@ wellspring-gateway  ──路由/鉴权/TLS──▶  127.0.0.1:8787   wellsprin
 ## 安装与加载
 
 ```bash
-wellspring plugin install npm:@xyit-team/wellspring-gateway
+wellspring plugin install npm:@xyit/wellspring-gateway
 # 或
 wellspring plugin install github:xyit-team/wellspring-gateway
+
+# 旧包 @xyit-team/wellspring-gateway 已弃用，安装会提示迁移
 
 # 本地开发
 wellspring plugin link "$PWD"
@@ -403,8 +405,8 @@ npm run build:zip     # release/wellspring-gateway-<version>.zip
 
 ```bash
 # 改 package.json 的 version，提交后推同名 tag
-git tag -a v0.5.0 -m "v0.5.0"
-git push origin master refs/tags/v0.5.0
+git tag -a v0.6.0 -m "v0.6.0"
+git push origin master refs/tags/v0.6.0
 ```
 
 推 `v*` 标签触发 `release.yml`（zip + SHA256SUMS 挂 GitHub Release）与 `publish-npm.yml`
